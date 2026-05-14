@@ -1,9 +1,9 @@
 """Chat Node"""
 
 import logging
-from typing import List, Literal, cast
+import re
+from typing import Dict, List, Literal, Tuple, cast
 
-from copilotkit.langgraph import copilotkit_customize_config, copilotkit_emit_state
 from langchain.tools import tool
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
@@ -12,9 +12,9 @@ from langgraph.types import Command
 from src.lib.download import get_resource
 from src.lib.model import get_model
 from src.lib.state import AgentState, DataQuestion
-from src.lib.mcp_integration import (
-    get_visualization_iframe
-)
+from src.lib.chart_tool import GeneratePlotlyChart, run_chart_tool
+from src.lib.state import ChartSpec
+from src.lib.a2ui_tool import GenerateA2UIComponent
 
 logger = logging.getLogger(__name__)
 
@@ -42,47 +42,126 @@ def WriteResearchQuestion(research_question: str):  # pylint: disable=invalid-na
 def DeleteResources(urls: List[str]):  # pylint: disable=invalid-name,unused-argument
     """Delete the URLs from the resources."""
 
-
 @tool
-def GenerateDataQuestions(questions: List[DataQuestion]):  # pylint: disable=invalid-name,unused-argument
+def DeepScrapeWebsite(url: str):  # pylint: disable=invalid-name,unused-argument
+    """Use this tool to bypass search engine snippets and download the FULL text content of a specific URL (up to 50,000 characters). Use this when you need deep insights from a specific page."""
+
+
+
+
+
+_NUM_RE = re.compile(r'\d+\.?\d*')
+
+def _nums_from_text(text: str) -> List[str]:
+    """Extract all numeric strings (stripped of %, $, commas) from text."""
+    return [m.group(0) for m in _NUM_RE.finditer(re.sub(r"[%$,]", " ", text))]
+
+
+def _auto_inject_citations(
+    report: str, extracted_facts: List[dict], resources: List[dict]
+) -> Tuple[str, Dict[str, dict]]:
     """
-    Generate 3-6 data-focused questions to search Tako's knowledge base.
-
-    Create a diverse set of questions:
-    - 2-4 basic questions (search_effort='fast') for straightforward data lookups AND superlative/ranking queries
-    - 0-1 prediction market questions (search_effort='deep') about forecasts, probabilities, or future outcomes
-
-    CRITICAL - Generate ATOMIC, non-compound queries:
-    - Each query should ask for ONE metric/dimension only
-    - NEVER combine multiple metrics in a single query (e.g., "compare X and Y", "X vs Y", "X and Y trends")
-    - Instead, split compound questions into separate atomic queries
-
-    BAD (compound):
-    - "Compare San Francisco fentanyl consumption and population"
-    - "China GDP vs inflation"
-    - "Unemployment and wage growth in the US"
-
-    GOOD (atomic):
-    - "San Francisco fentanyl consumption"
-    - "San Francisco population"
-    - "China GDP"
-    - "China inflation"
-    - "US unemployment rate"
-    - "US wage growth"
-
-    Superlative/ranking queries are fine (these are atomic):
-    - "Which countries have the highest GDP per capita?"
-    - "Which cities have the highest rent?"
-    - "Top 10 companies by market cap"
-
-    Example:
-    [
-        {"question": "China GDP since 1960", "search_effort": "fast", "query_type": "basic"},
-        {"question": "China inflation rate", "search_effort": "fast", "query_type": "basic"},
-        {"question": "Which countries have the highest inflation rates in 2024?", "search_effort": "fast", "query_type": "basic"},
-        {"question": "What are prediction market odds for China invading Taiwan in 2025?", "search_effort": "deep", "query_type": "prediction_market"}
-    ]
+    Match numbers from resources against the report, inject [N] markers inline.
+    Three strategies in order: extracted facts → content numerics → title keywords → guaranteed.
+    Returns (annotated_report, citations_dict).
     """
+    report_lower = report.lower()
+    value_to_n: Dict[str, int] = {}  # display_string → 1-based resource index
+
+    # ── Strategy A: match extracted_numerics fact values against resource content ──
+    for i, resource in enumerate(resources[:25]):
+        content = (resource.get("content", "") or resource.get("description", "")).lower()
+        for fact in extracted_facts:
+            val = fact.get("value", "").strip()
+            if val and len(val) >= 3 and val not in value_to_n:
+                core = re.sub(r"[%$,]", "", val).strip()
+                if core and core.lower() in content:
+                    value_to_n[val] = i + 1
+
+    # ── Strategy B: extract numbers FROM each resource, find them IN the report ──
+    if not value_to_n:
+        for i, resource in enumerate(resources[:20]):
+            content_raw = resource.get("content", "") or resource.get("description", "")
+            if not content_raw:
+                continue
+            content_nums = set(_nums_from_text(content_raw))
+            for num in content_nums:
+                # skip trivial numbers (years, single digits, etc.)
+                if not num or len(num) < 2 or (len(num) == 4 and num.startswith("20")):
+                    continue
+                # find this number with word boundaries in the report
+                pat = re.compile(rf'(?<!\d){re.escape(num)}(?!\d)')
+                if not pat.search(report_lower):
+                    continue
+                # use the widest match in the report (num% preferred over bare num)
+                wide = re.search(rf'(?<!\d){re.escape(num)}\s*%', report)
+                val_display = wide.group(0).strip() if wide else num
+                if val_display not in value_to_n:
+                    value_to_n[val_display] = i + 1
+
+    # ── Strategy C: title keyword match → inject after nearest number ──
+    if not value_to_n:
+        for i, resource in enumerate(resources[:15]):
+            title = resource.get("title", resource.get("source", ""))
+            # Use longest word from title (≥5 chars) as anchor
+            keywords = sorted(
+                [w.lower() for w in re.split(r'\W+', title) if len(w) >= 5],
+                key=len, reverse=True
+            )[:3]
+            for kw in keywords:
+                if kw in report_lower:
+                    # find the nearest number after the keyword position
+                    kw_pos = report_lower.find(kw)
+                    nearby = report[kw_pos:kw_pos + 300]
+                    m = re.search(r'\d+\.?\d*\s*%|\d+[.,]\d+|\d{3,}', nearby)
+                    if m:
+                        val_str = m.group(0).strip()
+                        if val_str not in value_to_n:
+                            value_to_n[val_str] = i + 1
+                    break
+
+    # ── Strategy D (guaranteed): pair first non-year numbers in report with top resources ──
+    if not value_to_n and resources:
+        num_matches = list(re.finditer(r'\d+\.?\d*\s*%|\d+[.,]\d+|\b\d{3,}\b', report))
+        non_year = [m for m in num_matches if not re.fullmatch(r'(?:19|20)\d{2}', m.group(0).strip())]
+        candidates = non_year if non_year else num_matches
+        for j, m in enumerate(candidates[:min(4, len(resources))]):
+            val_str = m.group(0).strip()
+            if val_str not in value_to_n:
+                value_to_n[val_str] = j + 1
+
+    if not value_to_n:
+        return report, {}
+
+    logger.info(f"[citations] value_to_n has {len(value_to_n)} entries: {list(value_to_n.items())[:5]}")
+
+    citations: Dict[str, dict] = {}
+    annotated = report
+    used: set = set()
+
+    # Longest values first to avoid partial-match collisions
+    for val in sorted(value_to_n, key=len, reverse=True):
+        if val in used:
+            continue
+        n = value_to_n[val]
+        marker = f"[{n}]"
+        escaped = re.escape(val)
+        # Inject marker after the FIRST occurrence of val not already followed by [N]
+        pattern = re.compile(rf"({escaped})(?!\s*\[\d+\])")
+        new_annotated, count = pattern.subn(rf"\1{marker}", annotated, count=1)
+        if count:
+            annotated = new_annotated
+            used.add(val)
+            if str(n) not in citations:
+                r = resources[n - 1]
+                raw = r.get("content", "") or r.get("description", "")
+                citations[str(n)] = {
+                    "url": r.get("url", ""),
+                    "title": r.get("title", ""),
+                    "snippet": raw[:300].strip(),
+                }
+
+    return annotated, citations
 
 
 async def chat_node(
@@ -93,65 +172,22 @@ async def chat_node(
     """
     logger.info("=== CHAT_NODE: Starting execution ===")
 
-    # Note: report is NOT in emit_intermediate_state to prevent flicker
-    # The report is only emitted once charts are injected
-    config = copilotkit_customize_config(
-        config,
-        emit_intermediate_state=[
-            {
-                "state_key": "research_question",
-                "tool": "WriteResearchQuestion",
-                "tool_argument": "research_question",
-            },
-            {
-                "state_key": "data_questions",
-                "tool": "GenerateDataQuestions",
-                "tool_argument": "questions",
-            },
-        ],
-    )
-
     state["resources"] = state.get("resources", [])
     research_question = state.get("research_question", "")
     report = state.get("report", "")
 
     resources = []
-    tako_charts_map = {}
-    available_tako_charts = []
 
     for resource in state["resources"]:
-        # Tako charts - use stored description as content
         if resource.get("resource_type") == "tako_chart":
-            title = resource.get("title", "")
-            card_id = resource.get("card_id")  # Changed from pub_id
-            embed_url = resource.get("embed_url")
-            description = resource.get("description", "")
-
-            # Add to resources with description as content
-            resources.append({
-                **resource,
-                "content": description
-            })
-
-            # Build Tako charts map for post-processing (generate iframe on demand)
-            if title and (card_id or embed_url):
-                # Store card_id/embed_url for later iframe generation
-                tako_charts_map[title] = {"card_id": card_id, "embed_url": embed_url}
-                available_tako_charts.append(f"  - **{title}**\n    Description: {description}")
+            resources.append({**resource, "content": resource.get("description", "")})
         else:
-            # Web resources: use pre-stored Tavily summary (no download needed)
             content = resource.get("content", "")
             if not content:
-                # Fallback: download if content is missing (shouldn't happen normally)
                 content = get_resource(resource["url"])
                 if content == "ERROR":
                     continue
             resources.append({**resource, "content": content})
-
-    available_tako_charts_str = "\n".join(available_tako_charts) if available_tako_charts else "  (No Tako charts available yet)"
-
-    logger.info(f"Built tako_charts_map with {len(tako_charts_map)} charts")
-    logger.info(f"Chart titles: {list(tako_charts_map.keys())}")
 
     model = get_model(state)
     # Prepare the kwargs for the ainvoke method
@@ -159,303 +195,356 @@ async def chat_node(
     if model.__class__.__name__ in ["ChatOpenAI"]:
         ainvoke_kwargs["parallel_tool_calls"] = False
 
-    # Build dynamic prompt based on feature toggles
-    if ENABLE_DEEP_QUERIES:
-        data_questions_instructions = """2. THEN: Use GenerateDataQuestions to create 3-6 data-focused questions with varied complexity:
-               - Generate ATOMIC queries - each query asks for ONE metric/dimension only
-               - 2-3 BASIC questions (fast search) for straightforward data: "Country X GDP 2020-2024"
-               - 1-2 COMPLEX questions (deep search) for analytical insights
-               - 0-1 PREDICTION MARKET question (deep search) if relevant: "What are prediction market odds for X in 2025?"
-               - Use the entities, metrics, cohorts, and time periods listed in the knowledge base context above when available
-               - Prefer exact entity/metric names from the knowledge base context for better search results"""
-    else:
-        data_questions_instructions = """2. THEN: Use GenerateDataQuestions to create 3-6 data-focused questions:
-               - Generate ATOMIC queries - each query asks for ONE metric/dimension only
-               - Instead, split compound questions into separate atomic queries
-               - Examples of GOOD atomic queries:
-                 * "US GDP 2020-2024" (single metric)
-                 * "US inflation rate" (single metric, separate query)
-                 * "Which countries have the highest rent?" (superlative - this is atomic)
-                 * "Top 10 companies by revenue" (ranking - this is atomic)
-               - Examples of BAD compound queries to AVOID:
-                 * "Compare US GDP and inflation" -> split into two queries
-                 * "San Francisco population vs rent" -> split into two queries
-               - 0-1 PREDICTION MARKET question (deep search) if relevant: "What are prediction market odds for X in 2025?"
-               - Use the entities, metrics, cohorts, and time periods listed in the knowledge base context above when available
-               - Prefer exact entity/metric names from the knowledge base context for better search results"""
-
-    # Add status update for query analysis
     state["logs"] = state.get("logs", [])
-    state["logs"].append({"message": "Analyzing your research query...", "done": False})
-    await copilotkit_emit_state(config, state)
+    has_resources = len(resources) > 0
+    log_msg = f"Synthesizing {len(resources)} source(s) for your query…" if has_resources else "Analyzing your research query…"
+    state["logs"].append({"message": log_msg, "done": False})
+
+    from src.lib.sanitize import sanitize_messages
+    sanitized_messages = sanitize_messages(state["messages"])
+
+    # Build extracted data context for system prompt
+    extracted_facts = state.get("extracted_numerics", [])
+    chart_datasets = state.get("chart_datasets", [])
+
+    data_context = ""
+    if chart_datasets or extracted_facts:
+        data_context = "\n══════════════════════════════════════\n"
+        data_context += "📊 ข้อมูลจริงที่สกัดได้จากการค้นหา — ใช้สร้างกราฟได้ทันที\n"
+        data_context += "══════════════════════════════════════\n"
+
+        if chart_datasets:
+            data_context += "🎯 CHART-READY DATASETS (ใช้ค่าเหล่านี้โดยตรงใน GeneratePlotlyChart — ห้าม hallucinate ตัวเลขเพิ่ม):\n"
+            for ds in chart_datasets[-6:]:
+                data_context += f"\n  ชื่อกราฟ: {ds.get('chart_title')} [type: {ds.get('chart_type')}]\n"
+                data_context += f"  x_axis: {ds.get('x_axis', [])}\n"
+                for s in ds.get("series", []):
+                    data_context += f"  series → {s.get('name')}: {s.get('values')}\n"
+
+        if extracted_facts:
+            data_context += "\n📈 NUMERICAL FACTS:\n"
+            for f in extracted_facts[-40:]:
+                period = f" ({f.get('period')})" if f.get("period") else ""
+                data_context += f"  • {f.get('entity')}: {f.get('metric')} = {f.get('value')}{period}\n"
+
+    system_prompt = f"""คุณคือนักวิจัยอัจฉริยะและนักวิทยาศาสตร์ข้อมูลระดับเชี่ยวชาญ มีหน้าที่สร้างรายงานวิจัยเชิงลึกพร้อมการวิเคราะห์เชิงตัวเลขและภาพข้อมูลที่น่าประทับใจ
+
+══════════════════════════════════════
+ภาษา / LANGUAGE
+══════════════════════════════════════
+- ตอบ สื่อสาร และเขียนรายงาน: ภาษาไทยเท่านั้น
+- Search queries และ tool arguments: ภาษาอังกฤษเท่านั้น (เพื่อให้ได้ผลลัพธ์ที่ดีที่สุด)
+
+══════════════════════════════════════
+ขั้นตอนการวิจัย (ทำตามลำดับนี้เสมอ)
+══════════════════════════════════════
+1. WRITE RESEARCH QUESTION — เรียก WriteResearchQuestion เพื่อกำหนดคำถามวิจัยหลักก่อน ถ้ามีคำถามแล้วข้ามขั้นนี้
+2. PLAN & SEARCH — แตกคำถามใหญ่เป็น sub-queries ภาษาอังกฤษหลายๆ อัน (สูงสุด 10) แล้วส่งทั้งหมดพร้อมกันใน Search ครั้งเดียว
+
+   ⚠️ ถ้าคำถามเกี่ยวกับ market share, ranking, การเปรียบเทียบ, หรือ top N — กฎบังคับ:
+   • ต้องมี query ระดับ entity เสมอ (ระบุ "by brand", "by manufacturer", "by company")
+     เช่น "EV market share by brand Thailand 2025"
+   • ต้องมี query ที่ระบุชื่อ entity ที่รู้จัก
+     เช่น "BYD Tesla MG Neta ORA EV sales Thailand 2025"
+   • ต้องมี query หา top list / ranking
+     เช่น "top selling EV brands Thailand 2025 ranking list"
+   • ห้ามส่งแค่ query ระดับรวม (aggregate) เช่น "EV market share Thailand" โดยไม่มี breakdown query คู่
+
+   ⚠️ ถ้าคำถามระบุช่วงปี (เช่น 2018–2024) — กฎบังคับ:
+   • ต้องใส่ปีทุกปีในช่วงนั้นใน query เสมอ เช่น "G7 GDP growth 2018 2019 2020 2021 2022 2023 2024"
+   • ต้องเพิ่ม query ที่เจาะ historical data โดยตรง เช่น:
+     "G7 GDP annual growth rate historical data worldbank"
+     "list of countries by real GDP growth rate wikipedia 2018 2024"
+   • ห้ามส่ง query ที่ระบุแค่ปีล่าสุด (เช่น "2024 only") เมื่อผู้ใช้ขอข้อมูลหลายปี
+
+3. DEEP SCRAPE (สำคัญมากสำหรับข้อมูล historical) — เรียก DeepScrapeWebsite ทันทีเมื่อ:
+   • search results ไม่ครอบคลุมทุกปีที่ผู้ใช้ถาม
+   • พบ URL ของ Wikipedia, WorldBank, IMF, OECD ที่น่าจะมีตาราง historical
+   • ตัวอย่าง URL ที่มีข้อมูลครบ: Wikipedia "GDP by country", WorldBank "data.worldbank.org"
+   ❌ ห้าม WriteReport ถ้ายังขาดข้อมูลปีใดปีหนึ่งในช่วงที่ผู้ใช้ถาม
+
+4. VISUALIZE DATA — หลังได้ข้อมูลตัวเลขแล้ว ต้องเรียก GeneratePlotlyChart อย่างน้อย 1 ครั้ง (ดูกฎด้านล่าง)
+5. STRUCTURED COMPONENTS — เรียก GenerateA2UIComponent เพื่อแสดงตัวเลขสำคัญและตารางเปรียบเทียบ
+6. WRITE REPORT — เรียก WriteReport เพื่อเขียนรายงานฉบับสมบูรณ์เป็นภาษาไทย ใช้เฉพาะตัวเลขที่ได้จาก search/scrape เท่านั้น ห้าม hallucinate ปีที่ไม่มีข้อมูล
+7. FOLLOW UP — ส่งข้อความสั้น 1-2 ประโยค ถามว่าอยากให้ปรับอะไรเพิ่มเติม
+
+══════════════════════════════════════
+กฎการสร้างกราฟ (CHART RULES — บังคับ)
+══════════════════════════════════════
+▸ MANDATORY: ถ้าหัวข้อมีสถิติ, ตัวเลข, การเปรียบเทียบ, หรือแนวโน้ม → ต้องสร้างกราฟเสมอ ห้ามรอให้ผู้ใช้ขอ
+▸ ถ้ามี CHART-READY DATASETS ใน "📊 ข้อมูลจริง" ด้านล่าง → ต้องใช้ค่าเหล่านั้นโดยตรงใน GeneratePlotlyChart ห้าม hallucinate ตัวเลข
+▸ หลังเรียก GeneratePlotlyChart แล้ว tool จะคืน marker เช่น [CHART:abc12345] → ต้องวาง marker นั้นในรายงานตรงตำแหน่งที่ต้องการแสดงกราฟทุกครั้ง ห้ามแต่งหรือเดา chart ID เอง
+
+เลือกประเภทกราฟตามข้อมูล:
+| ข้อมูล | chart_type |
+|--------|-----------|
+| แนวโน้มตามเวลา/ปี | `line` หรือ `area` |
+| ส่วนแบ่ง/เปอร์เซ็นต์ | `donut` หรือ `pie` |
+| เปรียบเทียบหมวดหมู่ | `bar` |
+| ชื่อหมวดหมู่ยาว | `horizontal_bar` |
+| เปรียบเทียบหลายมิติ (3+ metrics) | `radar` |
+| ราคาหุ้น/crypto OHLC | `candlestick` |
+| ความสัมพันธ์ 2 ตัวแปร | `scatter` |
+| ข้อมูลไหล/ลำดับขั้น | `funnel` |
+| กำไร-ขาดทุน running total | `waterfall` |
+| ความเข้มข้น matrix | `heatmap` |
+
+รูปแบบ series สำหรับกราฟแต่ละประเภท:
+- bar/line/area: x_axis=["ม.ค.","ก.พ.",...], series=[{{name:"ชุดข้อมูล", values:[1,2,3,...]}}]
+- donut/pie (แนะนำ): series=[{{name:"Tesla",values:[23.5]}}, {{name:"BYD",values:[18.3]}}, ...] (แต่ละ entity เป็น series แยก)
+- radar: x_axis=["ราคา","แบตเตอรี่","ความเร็ว"], series=[{{name:"Tesla",values:[80,95,90]}}, ...]
+- เปรียบเทียบหลาย series: series=[{{name:"ปี 2023",values:[...]}}, {{name:"ปี 2024",values:[...]}}]
+
+══════════════════════════════════════
+กฎ A2UI Components
+══════════════════════════════════════
+ใช้ GenerateA2UIComponent ควบคู่กับกราฟเสมอ:
+- stat_card: ตัวเลขพาดหัวเดียว เช่น GDP $500B (+3.2% YoY)
+- kpi_row: KPI หลายตัวเรียงแนวนอน เช่น GDP + เงินเฟ้อ + การว่างงาน
+- comparison_table: เปรียบเทียบหลาย entity ข้ามหลาย attribute
+- data_grid: ตารางข้อมูลที่มี header และ row ชัดเจน
+- timeline: เหตุการณ์สำคัญตามลำดับเวลา
+▸ ถ้าต้องการตารางเปรียบเทียบใน report ให้ใช้ markdown table ปกติได้เลย (| col | col |)
+▸ GenerateA2UIComponent สร้าง component ใน Data tab (แยกจาก report) — ไม่ต้องเขียน placeholder ใดๆ ใน report
+
+══════════════════════════════════════
+แนวทางการเขียนรายงาน
+══════════════════════════════════════
+- เขียนรายงานเชิงวิเคราะห์เชิงลึก ไม่ใช่แค่สรุปข้อมูล
+- ทุกกราฟต้องมีย่อหน้าอธิบาย: ข้อมูลบอกว่าอะไร → ทำไมถึงสำคัญ → ผลกระทบคืออะไร
+- วาง [CHART:id] ไว้ในเนื้อหาตรงจุดที่เหมาะสม ไม่ใช่รวมกันท้ายรายงาน
+- ใช้ตัวเลขจริงจาก search results เสมอ ห้าม hallucinate ตัวเลข
+- ห้ามใช้ ![image](url) หรือ link ภายนอก
+- โครงสร้างรายงาน: บทนำ → วิเคราะห์ข้อมูล (พร้อมกราฟ) → สรุปและข้อเสนอแนะ
+{state.get("explore_context", "")}
+══════════════════════════════════════
+การอ้างอิงแหล่งข้อมูล (INLINE CITATIONS — บังคับทำทุกครั้ง)
+══════════════════════════════════════
+▸ ต้องใส่ [N] ต่อท้ายตัวเลขและสถิติทุกตัวในรายงาน ห้ามข้าม
+▸ N คือหมายเลขใน "ดัชนีแหล่งข้อมูล" ด้านล่าง — ดูว่า source ไหนมีข้อมูลนั้น แล้วใช้หมายเลขนั้น
+▸ ถ้าไม่แน่ใจว่า source ไหน → ใช้ [1] ก็ได้ แต่ต้องใส่เสมอ
+▸ ไม่ต้องมีช่องว่างก่อน [N] เช่น: "เติบโต 2.5%[1]" หรือ "มูลค่า 500 พันล้าน[2]"
+▸ ตัวอย่าง: "GDP เติบโต 2.5%[1] ขณะที่ CPI อยู่ที่ 3.2%[2] และ FDI รวม $45B[1]"
+
+══════════════════════════════════════
+บริบทปัจจุบัน
+══════════════════════════════════════
+คำถามวิจัย: {research_question or "(ยังไม่ได้กำหนด)"}
+
+รายงานปัจจุบัน: {report or "(ยังไม่มี)"}
+
+ดัชนีแหล่งข้อมูล ({len(resources)} แหล่ง):
+{chr(10).join(
+    f"[{i+1}] {r.get('title', r.get('source', 'Unknown'))[:80]} — {r.get('url', '')}"
+    + (f"\n     ↳ {(r.get('content','') or r.get('description',''))[:180].strip()}" if (r.get('content','') or r.get('description','')) else "")
+    for i, r in enumerate(resources[:25])
+)}
+{data_context}"""
 
     response = await model.bind_tools(
         [
             Search,
             WriteReport,
             WriteResearchQuestion,
-            GenerateDataQuestions,
+            GeneratePlotlyChart,
+            GenerateA2UIComponent,
+            DeepScrapeWebsite,
         ],
-        **ainvoke_kwargs,  # Pass the kwargs conditionally
+        **ainvoke_kwargs,
     ).ainvoke(
-        [
-            SystemMessage(
-                content=f"""
-            You are a research assistant. You help the user with writing a research report.
-            Do not recite the resources, instead use them to answer the user's question.
-
-            {state.get("explore_context", "")}
-
-            RESEARCH WORKFLOW:
-            1. FIRST: When you receive a user's query, use WriteResearchQuestion to extract/formulate the core research question
-            {data_questions_instructions}
-            3. These questions will search Tako for relevant charts and visualizations
-            4. Use the Search tool for web resources
-            5. Write a clear, well-structured report using the data from your searches
-            6. Combine insights from both Tako charts and web resources in your report
-
-            IMPORTANT ABOUT RESEARCH QUESTION:
-            - Always start by using WriteResearchQuestion to capture the user's research intent
-            - This creates a clear, focused question from their natural language query
-            - If a research question is already provided, YOU MUST NOT ASK FOR IT AGAIN
-
-            AVAILABLE DATA VISUALIZATIONS ({len(tako_charts_map)} charts):
-{available_tako_charts_str}
-
-            WRITING GUIDELINES:
-            - Write a COMPREHENSIVE report with substantial analysis and narrative text
-            - Use the chart descriptions above AND web resources to write detailed, insightful paragraphs
-            - For EACH chart, write at least 1-2 paragraphs discussing its key insights, trends, and implications
-            - Structure the report so that text naturally leads into and follows from each data point
-            - DO NOT include any chart markers, image syntax, or embed codes - charts will be inserted automatically
-            - DO NOT use markdown image syntax like ![title](url)
-            - DO NOT include external links like tradingeconomics.com
-            - Focus on analysis and insights - explain WHAT the data shows and WHY it matters
-            - Reference specific data points, numbers, and trends from the chart descriptions
-            - Connect insights across multiple charts to tell a cohesive story
-
-            You should use the search tool to get resources before answering the user's question.
-            Use the content and descriptions from both Tako charts and web resources to inform your report.
-            To write the report, you should use the WriteReport tool. Never EVER respond with the report content, only use the tool.
-            After writing the report, send a brief (1-2 sentence) follow-up asking if the user wants any changes or has questions. Do NOT summarize or repeat the report content in the chat.
-
-            This is the research question:
-            {research_question}
-
-            This is the research report:
-            {report}
-
-            Here are the resources that you have available:
-            {resources}
-            """
-            ),
-            *state["messages"],
-        ],
+        [SystemMessage(content=system_prompt), *sanitized_messages],
         config,
     )
 
-    # Mark query analysis as complete
     state["logs"][-1]["done"] = True
-    await copilotkit_emit_state(config, state)
 
     ai_message = cast(AIMessage, response)
     if ai_message.tool_calls:
-        if ai_message.tool_calls[0]["name"] == "WriteReport":
-            # Add progress indicator for report generation
-            state["logs"].append({"message": "Writing research report...", "done": False})
-            await copilotkit_emit_state(config, state)
+        tool_messages = []
+        goto_node = "chat_node"
+        
+        # Check if AI called WriteReport in parallel with data gathering tools
+        has_chart_or_search = any(tc["name"] in ["GeneratePlotlyChart", "GenerateA2UIComponent", "Search", "DeepScrapeWebsite"] for tc in ai_message.tool_calls)
+        
+        for i, call in enumerate(ai_message.tool_calls):
+            name = call["name"]
+            
+            if name == "WriteResearchQuestion":
+                rq = call["args"].get("research_question", "")
+                state["research_question"] = rq
+                state["logs"].append({"message": f"Research question: {rq[:80]}{'…' if len(rq) > 80 else ''}", "done": True})
+                tool_messages.append(ToolMessage(tool_call_id=call["id"], content="Research question written."))
+                
+            elif name == "GeneratePlotlyChart":
+                try:
+                    import json as _json_chart
+                    result = run_chart_tool(call["args"])
+                    if result.startswith("CHART_READY:"):
+                        rest = result[len("CHART_READY:"):]
+                        pipe_idx = rest.index("|OPTION:")
+                        meta = rest[:pipe_idx]
+                        option_json = rest[pipe_idx + len("|OPTION:"):]
+                        colon_idx = meta.index(":")
+                        chart_id = meta[:colon_idx]
+                        chart_title = meta[colon_idx + 1:]
+                        option = _json_chart.loads(option_json)
+                        chart_spec: ChartSpec = {"id": chart_id, "title": chart_title, "option": option}
+                        if call["args"].get("source_attribution"):
+                            chart_spec["source"] = call["args"]["source_attribution"]
+                        state.setdefault("charts", []).append(chart_spec)
+                        state["logs"].append({"message": f"Chart generated: {chart_title}", "done": True})
+                        tool_messages.append(ToolMessage(
+                            tool_call_id=call["id"],
+                            content=f"Chart '{chart_title}' generated with ID {chart_id}. You MUST insert the marker [CHART:{chart_id}] exactly at the appropriate position in your report using WriteReport."
+                        ))
+                    else:
+                        tool_messages.append(ToolMessage(tool_call_id=call["id"], content=result))
+                except Exception as e:
+                    tool_messages.append(ToolMessage(tool_call_id=call["id"], content=f"Failed to generate chart: {str(e)}"))
+                    
+            elif name == "GenerateA2UIComponent":
+                import json as _json
+                try:
+                    component = {
+                        "type": call["args"].get("type"),
+                        "title": call["args"].get("title"),
+                        "data": call["args"].get("data", {}),
+                    }
+                    if call["args"].get("source"):
+                        component["source"] = call["args"]["source"]
+                    state.setdefault("pending_a2ui", []).append(component)
+                    state["logs"].append({"message": f"A2UI component generated: {component['title']}", "done": True})
+                    tool_messages.append(ToolMessage(
+                        tool_call_id=call["id"],
+                        content=f"A2UI component '{component['title']}' ({component['type']}) generated and queued for display."
+                    ))
+                except Exception as e:
+                    tool_messages.append(ToolMessage(tool_call_id=call["id"], content=f"Failed to generate A2UI component: {e}"))
 
-            report = ai_message.tool_calls[0]["args"].get("report", "")
+            elif name == "DeepScrapeWebsite":
+                url = call["args"].get("url", "")
+                state["logs"].append({"message": f"Deep Scraping {url}...", "done": False})
+                try:
+                    import aiohttp
+                    import html2text
+                    import asyncio
+                    async def fetch_and_parse():
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15) as response:
+                                response.raise_for_status()
+                                html_content = await response.text()
+                                return html2text.html2text(html_content)[:50000]
+                    # We have to await it, but we are inside an async function so it's fine.
+                    # Wait, chat_node is an async function, we can just await directly here!
+                    # Actually, the original loop wasn't async-friendly if I use await inside it.
+                    # Yes it was, the loop is inside `async def chat_node`.
+                    content = await fetch_and_parse()
+                    scrape_res = f"DEEP SCRAPE RESULTS for {url}:\n\n{content}"
+                    tool_messages.append(ToolMessage(tool_call_id=call["id"], content=scrape_res))
+                except Exception as e:
+                    tool_messages.append(ToolMessage(tool_call_id=call["id"], content=f"Scrape failed: {str(e)}"))
+                state["logs"][-1]["done"] = True
+                    
+            elif name == "Search":
+                goto_node = "search_node"
+                queries_preview = call["args"].get("queries", [])
+                n = len(queries_preview)
+                state["logs"].append({"message": f"Dispatching {n} search quer{'y' if n == 1 else 'ies'}…", "done": True})
+                # For Search, we do not append ToolMessage here. search_node handles it.
+                
+            elif name == "DeleteResources":
+                goto_node = "delete_node"
+                
+            elif name == "WriteReport":
+                if has_chart_or_search:
+                    tool_messages.append(ToolMessage(tool_call_id=call["id"], content="ERROR: You called WriteReport at the same time as generating a chart or searching. You must wait for the chart URL or search results first! I have generated the chart/search for you. Please use WriteReport in the NEXT turn using the newly provided data and URLs."))
+                else:
+                    state["report"] = call["args"].get("report", "")
 
-            # Mark report writing as done
-            state["logs"][-1]["done"] = True
-            await copilotkit_emit_state(config, state)
+                    external_domains = r"(tradingeconomics|worldbank|imf|fred|ourworldindata|statista)"
+                    state["report"] = re.sub(rf"\!\[([^\]]+)\]\(https?://[^)]*{external_domains}[^)]*\)", r"", state["report"], flags=re.IGNORECASE)
+                    state["report"] = re.sub(r"\!\[[^\]]*\]\([^)]+\)", "", state["report"])
+                    state["report"] = re.sub(r"\[TAKO_CHART:[^\]]+\]", "", state["report"])
+                    # Strip unfilled template placeholders: {comparison_table} {} { }
+                    state["report"] = re.sub(r'\{[a-z][a-z_0-9]*\}|\{\s*\}', "", state["report"])
 
-            # Clean up: Remove any markdown image links that the LLM incorrectly added
-            import re
-            external_domains = r'(tradingeconomics|worldbank|imf|fred|ourworldindata|statista)'
-            report = re.sub(rf'!\[([^\]]+)\]\(https?://[^)]*{external_domains}[^)]*\)',
-                          r'', report, flags=re.IGNORECASE)
+                    resources_list = resources  # use content-enriched local var
+                    extracted_facts = state.get("extracted_numerics", [])
 
-            # Remove any markdown images
-            report = re.sub(r'!\[[^\]]*\]\([^)]+\)', '', report)
-
-            # Remove any leftover chart markers (in case model still added them)
-            report = re.sub(r'\[TAKO_CHART:[^\]]+\]', '', report)
-
-            # Second pass: Inject charts at appropriate positions
-            processed_report = report
-            if tako_charts_map:
-                state["logs"].append({"message": "Inserting data visualizations...", "done": False})
-                await copilotkit_emit_state(config, state)
-                # Build chart list for injection prompt
-                chart_list = "\n".join([f"- {title}" for title in tako_charts_map.keys()])
-
-                # Ask model to insert chart markers at appropriate positions
-                inject_response = await model.ainvoke(
-                    [
-                        SystemMessage(content=f"""You are a report editor. Your task is to insert chart markers into the report at appropriate positions.
-
-AVAILABLE CHARTS:
-{chart_list}
-
-RULES:
-1. Insert [CHART:exact_title] markers where each chart would best support the text
-2. Place markers AFTER the relevant paragraph (not in the middle of text)
-3. Each chart should be used exactly once
-4. Only use charts from the AVAILABLE CHARTS list above
-5. Return the COMPLETE report with markers inserted
-6. Do not modify the text content, only add markers
-7. Add a blank line before and after each marker
-
-CRITICAL PLACEMENT RULES:
-8. NEVER place more than two charts consecutively - there MUST be at least one paragraph of text between any two charts
-9. NEVER append multiple charts at the end of the report - distribute them throughout the text
-10. Each chart should be placed IMMEDIATELY after the paragraph that discusses its specific data/topic
-11. If the report doesn't have enough text to properly intersperse all charts, place charts where they're most relevant and leave remaining charts unplaced rather than clustering them
-
-Example of GOOD placement:
-The economy grew significantly in 2023...
-
-[CHART:GDP Growth 2023]
-
-This growth was driven by consumer spending. Meanwhile, unemployment continued its downward trend...
-
-[CHART:Unemployment Rate 2023]
-
-The labor market strength contributed to...
-
-Example of BAD placement (DO NOT DO THIS):
-The economy grew significantly in 2023...
-This growth was driven by consumer spending...
-The labor market showed improvement...
-
-[CHART:GDP Growth 2023]
-
-[CHART:Unemployment Rate 2023]
-
-[CHART:Inflation Data 2023]
-"""),
-                        HumanMessage(content=f"Insert chart markers into this report:\n\n{report}")
-                    ],
-                    config
-                )
-
-                report_with_markers = inject_response.content if hasattr(inject_response, 'content') else str(inject_response)
-
-                # Replace chart markers with actual iframe HTML
-                async def replace_marker(match):
-                    chart_title = match.group(1).strip()
-                    chart_info = tako_charts_map.get(chart_title)
-
-                    # Try case-insensitive match if exact match fails
-                    if not chart_info:
-                        for title, info in tako_charts_map.items():
-                            if title.lower() == chart_title.lower():
-                                chart_info = info
-                                break
-
-                    if not chart_info:
-                        logger.warning(f"Chart not found: {chart_title}")
-                        return ""
-
-                    iframe_html = await get_visualization_iframe(
-                        item_id=chart_info.get("card_id"),
-                        embed_url=chart_info.get("embed_url")
+                    logger.warning(
+                        f"[citations-debug] resources_list len={len(resources_list)}, "
+                        f"extracted_facts len={len(extracted_facts)}, "
+                        f"report_len={len(state['report'])}, "
+                        f"first_resource_content_len={len(resources_list[0].get('content','') or '') if resources_list else 0}"
                     )
 
-                    if iframe_html:
-                        iframe_only = re.sub(r'<script.*?</script>', '', iframe_html, flags=re.DOTALL)
-                        return "\n" + iframe_only.strip() + "\n"
-                    return ""
+                    # Check if LLM added its own [N] markers
+                    llm_cited = set(int(m) for m in re.findall(r'\[(\d+)\]', state["report"]))
 
-                # Find and replace all markers
-                markers = list(re.finditer(r'\[CHART:([^\]]+)\]', report_with_markers))
-                replacements = []
-                for match in markers:
-                    replacement = await replace_marker(match)
-                    replacements.append((match.start(), match.end(), replacement))
+                    if llm_cited:
+                        # Trust LLM markers — build citations from those
+                        citations: dict = {}
+                        for n in llm_cited:
+                            idx = n - 1
+                            if 0 <= idx < len(resources_list):
+                                r = resources_list[idx]
+                                raw = r.get("content", "") or r.get("description", "")
+                                citations[str(n)] = {
+                                    "url": r.get("url", ""),
+                                    "title": r.get("title", ""),
+                                    "snippet": raw[:300].strip(),
+                                }
+                        state["citations"] = citations
+                        logger.warning(f"[citations-debug] LLM added {len(llm_cited)} markers → citations={list(citations.keys())}")
+                    else:
+                        # Auto-inject: match extracted fact values against resource content
+                        state["report"], state["citations"] = _auto_inject_citations(
+                            state["report"], extracted_facts, resources_list
+                        )
+                        logger.warning(f"[citations-debug] auto-inject → {len(state['citations'])} citations: {list(state['citations'].keys())}")
 
-                # Apply replacements in reverse order
-                processed_report = report_with_markers
-                for start, end, replacement in reversed(replacements):
-                    processed_report = processed_report[:start] + replacement + processed_report[end:]
-
-                logger.info(f"Injected {len([r for r in replacements if r[2]])} charts into report")
-
-                # Mark chart injection as done
-                state["logs"][-1]["done"] = True
-                await copilotkit_emit_state(config, state)
-
-            # Clear logs before showing final report
-            state["logs"] = []
-            await copilotkit_emit_state(config, state)
-
+                    goto_node = "critic_node"
+                    
+        if goto_node == "chat_node":
             return Command(
                 goto="chat_node",
                 update={
-                    "report": processed_report,
-                    "resources": state.get("resources", []),  # Preserve resources
-                    "messages": [
-                        ai_message,
-                        ToolMessage(
-                            tool_call_id=ai_message.tool_calls[0]["id"],
-                            content="Report written successfully. Now send a brief follow-up message asking if the user wants any changes or has questions. Do NOT repeat the report content.",
-                        ),
-                    ],
-                },
+                    "messages": [ai_message] + tool_messages,
+                    "research_question": state.get("research_question", ""),
+                    "pending_a2ui": state.get("pending_a2ui", []),
+                    "charts": state.get("charts", []),
+                    "logs": state.get("logs", []),
+                    "extracted_numerics": state.get("extracted_numerics", []),
+                    "chart_datasets": state.get("chart_datasets", []),
+                    "citations": state.get("citations", {}),
+                }
             )
-        if ai_message.tool_calls[0]["name"] == "WriteResearchQuestion":
-            research_question = ai_message.tool_calls[0]["args"]["research_question"]
+        else:
             return Command(
-                goto="chat_node",
+                goto=goto_node,
                 update={
-                    "research_question": research_question,
-                    "resources": state.get("resources", []),  # Preserve resources
-                    "messages": [
-                        ai_message,
-                        ToolMessage(
-                            tool_call_id=ai_message.tool_calls[0]["id"],
-                            content="Research question written.",
-                        ),
-                    ],
-                },
+                    "messages": [ai_message] + tool_messages,
+                    "report": state.get("report", ""),
+                    "resources": state.get("resources", []),
+                    "pending_a2ui": state.get("pending_a2ui", []),
+                    "charts": state.get("charts", []),
+                    "logs": state.get("logs", []),
+                    "extracted_numerics": state.get("extracted_numerics", []),
+                    "chart_datasets": state.get("chart_datasets", []),
+                    "citations": state.get("citations", {}),
+                }
             )
+            
+    if len(ai_message.content) > 500:
+        return Command(
+            goto="chat_node",
+            update={
+                "messages": [
+                    ai_message,
+                    HumanMessage(content="SYSTEM ERROR: You wrote the report as plain text. You MUST use the WriteReport tool to submit the report! Please rewrite it using the WriteReport tool.")
+                ]
+            }
+        )
 
-    goto = "__end__"
-    if ai_message.tool_calls:
-        tool_name = ai_message.tool_calls[0]["name"]
-        if tool_name == "Search":
-            goto = "search_node"
-        elif tool_name == "DeleteResources":
-            goto = "delete_node"
-        elif tool_name == "GenerateDataQuestions":
-            # Store data questions and route to search
-            data_questions = ai_message.tool_calls[0]["args"].get("questions", [])
-
-            # Add status update for generated questions
-            if data_questions:
-                state["logs"].append({
-                    "message": f"Generated {len(data_questions)} search questions",
-                    "done": True
-                })
-                await copilotkit_emit_state(config, state)
-
-            logger.info(f"GenerateDataQuestions: Routing to search_node with {len(data_questions)} questions")
-            return Command(
-                goto="search_node",
-                update={
-                    "data_questions": data_questions,
-                    "resources": state.get("resources", []),  # Preserve resources
-                    "messages": [
-                        ai_message,
-                        ToolMessage(
-                            tool_call_id=ai_message.tool_calls[0]["id"],
-                            content=f"Generated {len(data_questions)} data questions for Tako search.",
-                        ),
-                    ],
-                },
-            )
-
-    logger.info(f"=== CHAT_NODE: Routing to {goto} ===")
-    return Command(goto=goto, update={"messages": response, "resources": state.get("resources", [])})
+    logger.info("=== CHAT_NODE: Routing to __end__ ===")
+    return Command(goto="__end__", update={"messages": [ai_message], "resources": state.get("resources", [])})

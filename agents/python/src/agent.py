@@ -13,6 +13,7 @@ from src.lib.chat import chat_node
 from src.lib.delete import delete_node, perform_delete_node
 from src.lib.download import download_node
 from src.lib.search import search_node
+from src.lib.critic import critic_node
 from src.lib.state import AgentState
 
 # Define a new graph
@@ -22,6 +23,7 @@ workflow.add_node("chat_node", chat_node)
 workflow.add_node("search_node", search_node)
 workflow.add_node("delete_node", delete_node)
 workflow.add_node("perform_delete_node", perform_delete_node)
+workflow.add_node("critic_node", critic_node)
 
 
 workflow.set_entry_point("download")
@@ -29,6 +31,8 @@ workflow.add_edge("download", "chat_node")
 workflow.add_edge("delete_node", "perform_delete_node")
 workflow.add_edge("perform_delete_node", "chat_node")
 workflow.add_edge("search_node", "download")
+# chat_node routes to critic_node conditionally via Command
+# critic_node routes to chat_node or __end__ conditionally via Command
 
 # Conditionally use a checkpointer based on the environment
 # This allows compatibility with both LangGraph API and CopilotKit

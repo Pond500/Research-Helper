@@ -54,3 +54,17 @@ coverage/
 # Misc
 *.pem
 .turbo
+.env.docker
+
+# Local data / cache (never commit)
+qdrant_storage/
+agents/python/.charts_cache/
+agents/python/__pycache__/
+agents/python/src/**/__pycache__/
+
+# Claude Code session data
+.claude/
+
+# Local dev docs (generated artifacts)
+*.pdf
+tako_backend_flow.html

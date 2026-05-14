@@ -1,0 +1,67 @@
+services:
+
+  # ---------------------------------------------------------------------------
+  # Qdrant — vector database for uploaded documents
+  # ---------------------------------------------------------------------------
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: tako_qdrant
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+    networks:
+      - tako_net
+
+  # ---------------------------------------------------------------------------
+  # Agent — Python FastAPI + LangGraph research agent
+  # ---------------------------------------------------------------------------
+  agent:
+    build:
+      context: ./agents/python
+      dockerfile: Dockerfile
+    container_name: tako_agent
+    env_file:
+      - .env.docker
+    environment:
+      QDRANT_URL: http://qdrant:10237
+      PORT: "10236"
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+    networks:
+      - tako_net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:10236/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Frontend — Next.js standalone (built with internal service URLs baked in)
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # Server-side proxy targets (baked into Next.js rewrites at build time)
+        REMOTE_ACTION_URL: http://agent:10236/copilotkit
+        AGENT_INTERNAL_URL: http://agent:10236
+        # Client-side agent URL — relative path, proxied through Next.js
+        NEXT_PUBLIC_AGENT_URL: /api/agent/research_agent
+    container_name: tako_frontend
+    ports:
+      - "10235:3000"
+    depends_on:
+      - agent
+    restart: unless-stopped
+    networks:
+      - tako_net
+
+networks:
+  tako_net:
+    driver: bridge
+
+volumes:
+  qdrant_data:

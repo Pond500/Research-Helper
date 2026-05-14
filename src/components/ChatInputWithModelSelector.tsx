@@ -1,8 +1,15 @@
-"use client";
+'use client';
 
-import { ModelSelector } from "./ModelSelector";
-import { useState } from "react";
-import type { InputProps } from "@copilotkit/react-ui";
+import { useState } from 'react';
+import { Send, Square } from 'lucide-react';
+
+type ChatInputProps = {
+  inProgress: boolean;
+  onSend: (message: string) => void | Promise<void>;
+  chatReady: boolean;
+  onStop?: () => void;
+  hideStopButton?: boolean;
+};
 
 export function ChatInputWithModelSelector({
   inProgress,
@@ -10,61 +17,64 @@ export function ChatInputWithModelSelector({
   chatReady,
   onStop,
   hideStopButton,
-}: InputProps) {
-  const [message, setMessage] = useState("");
+}: ChatInputProps) {
+  const [message, setMessage] = useState('');
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (message.trim() && !inProgress) {
       await onSend(message);
-      setMessage("");
+      setMessage('');
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSubmit(e as unknown as React.FormEvent);
     }
   };
 
   return (
-    <form onSubmit={handleSubmit} className="p-4 border-t border-gray-200">
-      <div className="border border-gray-300 rounded-xl focus-within:ring-2 focus-within:ring-[#6766FC] focus-within:border-transparent bg-white shadow-sm transition-all duration-200">
-        {/* First row: Text input */}
-        <div className="px-4 pt-3">
-          <input
-            type="text"
-            value={message}
-            onChange={(e) => setMessage(e.target.value)}
-            placeholder="Type a message..."
-            disabled={inProgress || !chatReady}
-            className="w-full text-base outline-none disabled:bg-white disabled:text-gray-400 placeholder:text-gray-400"
-          />
-        </div>
+    <form onSubmit={handleSubmit} className="p-3 border-t border-border bg-background">
+      <div
+        className={`flex items-center gap-2 bg-card rounded-2xl border px-3 py-2 shadow-sm transition-all duration-200 ${
+          inProgress ? 'border-primary/40' : 'border-border focus-within:border-primary focus-within:shadow-md focus-within:shadow-primary/10'
+        }`}
+      >
+        {/* Text input */}
+        <input
+          type="text"
+          value={message}
+          onChange={(e) => setMessage(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder={inProgress ? 'Agent is working…' : 'Ask a research question…'}
+          disabled={inProgress || !chatReady}
+          className="flex-1 text-sm outline-none bg-transparent text-foreground placeholder:text-muted-foreground disabled:cursor-not-allowed min-w-0"
+        />
 
-        {/* Second row: Model selector and Send button */}
-        <div className="px-4 pb-3 pt-2 flex items-center justify-between gap-3">
-          <div className="flex-shrink-0">
-            <ModelSelector />
-          </div>
-
-          <div className="flex-shrink-0">
-            {!inProgress ? (
-              <button
-                type="submit"
-                disabled={!message.trim() || !chatReady}
-                className="px-5 py-2 bg-[#6766FC] text-white rounded-lg hover:bg-[#5555eb] disabled:bg-gray-300 disabled:cursor-not-allowed font-medium text-sm transition-colors duration-200 shadow-sm"
-              >
-                Send
-              </button>
-            ) : (
-              !hideStopButton &&
-              onStop && (
-                <button
-                  type="button"
-                  onClick={onStop}
-                  className="px-5 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 font-medium text-sm transition-colors duration-200 shadow-sm"
-                >
-                  Stop
-                </button>
-              )
-            )}
-          </div>
-        </div>
+        {/* Action button */}
+        {!inProgress ? (
+          <button
+            type="submit"
+            disabled={!message.trim() || !chatReady}
+            className="flex-shrink-0 w-8 h-8 rounded-xl bg-primary text-primary-foreground flex items-center justify-center hover:bg-primary/90 disabled:opacity-30 disabled:cursor-not-allowed transition-all duration-150 shadow-sm"
+            aria-label="Send"
+          >
+            <Send className="w-3.5 h-3.5" />
+          </button>
+        ) : (
+          !hideStopButton && onStop && (
+            <button
+              type="button"
+              onClick={onStop}
+              className="flex-shrink-0 w-8 h-8 rounded-xl bg-destructive text-destructive-foreground flex items-center justify-center hover:bg-destructive/90 transition-all duration-150 shadow-sm"
+              aria-label="Stop"
+            >
+              <Square className="w-3.5 h-3.5 fill-current" />
+            </button>
+          )
+        )}
       </div>
     </form>
   );

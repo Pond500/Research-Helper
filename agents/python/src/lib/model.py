@@ -13,6 +13,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from src.lib.state import AgentState
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
@@ -25,6 +26,13 @@ def get_model(state: AgentState) -> BaseChatModel:
     model = os.getenv("MODEL", state_model)
 
     if model == "openai":
+        if OPENROUTER_API_KEY:
+            return ChatOpenAI(
+                temperature=0,
+                model="openai/gpt-4o-mini",
+                api_key=OPENROUTER_API_KEY,
+                base_url="https://openrouter.ai/api/v1",
+            )
         if not OPENAI_API_KEY:
             raise ValueError("OPENAI_API_KEY environment variable is not set")
         return ChatOpenAI(temperature=0, model="gpt-4o-mini", api_key=OPENAI_API_KEY)

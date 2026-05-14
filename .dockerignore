@@ -1,0 +1,15 @@
+node_modules
+.next
+.git
+.gitignore
+*.md
+Dockerfile
+.dockerignore
+.env*
+!.env.docker.example
+qdrant_storage
+agents/python/__pycache__
+agents/python/.venv
+agents/python/uv.lock
+*.log
+.DS_Store
