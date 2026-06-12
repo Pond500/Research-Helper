@@ -68,3 +68,6 @@ agents/python/src/**/__pycache__/
 # Local dev docs (generated artifacts)
 *.pdf
 tako_backend_flow.html
+
+# E2E test outputs
+tests/e2e/out/
