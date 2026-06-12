@@ -70,6 +70,7 @@ class AgentState(MessagesState):
     pending_a2ui: NotRequired[List[A2UIComponent]]
     charts: NotRequired[List[ChartSpec]]
     suggested_questions: NotRequired[List[str]]
+    delete_confirmation: NotRequired[str]         # "YES"/"NO" answered via the delete interrupt
     extracted_numerics: NotRequired[List[dict]]   # accumulated NumericFact dicts from all searches
     chart_datasets: NotRequired[List[dict]]       # chart-ready datasets from ExtractNumerics
     citations: NotRequired[Dict[str, dict]]       # "1" → {url, title, snippet}

@@ -231,7 +231,20 @@ def augment_queries(queries: List[str], cap: int) -> List[str]:
                 augmented.append(entity_twin)
                 budget -= 1
 
-    return augmented[:cap]
+    return _dedupe_similar(augmented)[:cap]
+
+
+def _dedupe_similar(queries: List[str], threshold: float = 0.8) -> List[str]:
+    """Drop queries whose token set overlaps ≥ threshold (Jaccard) with an earlier one."""
+    kept: List[str] = []
+    seen: List[set] = []
+    for q in queries:
+        toks = set(re.findall(r"[a-z0-9]+", q.lower()))
+        if toks and any(len(toks & s) / len(toks | s) >= threshold for s in seen):
+            continue
+        kept.append(q)
+        seen.append(toks)
+    return kept
 
 
 # ── Numerical extraction helper ──────────────────────────────────────────────

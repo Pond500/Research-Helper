@@ -59,10 +59,15 @@ export function ResearchCanvas({
   const lastQuestionRef = useRef<string>('');
 
   if (agentState.resources?.length > 0) lastResourcesRef.current = agentState.resources;
+  else if (!isRunning) lastResourcesRef.current = [];
   if (agentState.report?.length > 0) lastReportRef.current = agentState.report;
   if (agentState.research_question?.length > 0) lastQuestionRef.current = agentState.research_question;
 
-  const resources = agentState.resources?.length > 0 ? agentState.resources : lastResourcesRef.current;
+  // Anti-flicker only applies mid-run; when idle an empty list is the truth
+  // (e.g. the user just deleted every resource).
+  const resources = agentState.resources?.length > 0
+    ? agentState.resources
+    : isRunning ? lastResourcesRef.current : [];
   const report = agentState.report?.length > 0 ? agentState.report : lastReportRef.current;
   const researchQuestion = agentState.research_question?.length > 0
     ? agentState.research_question : lastQuestionRef.current;

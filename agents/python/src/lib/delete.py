@@ -1,38 +1,56 @@
 """Delete Resources"""
 
-import json
 from typing import cast
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
+from langgraph.types import interrupt
 
 from src.lib.state import AgentState
 
 
+def _find_delete_call(state: AgentState):
+    """Locate the most recent DeleteResources tool call in the message history."""
+    for msg in reversed(state["messages"]):
+        if isinstance(msg, AIMessage) and msg.tool_calls:
+            for tc in msg.tool_calls:
+                if tc["name"] == "DeleteResources":
+                    return tc
+    return None
+
+
 async def delete_node(state: AgentState, config: RunnableConfig):  # pylint: disable=unused-argument
     """
-    Delete Node
+    Pause the graph (dynamic interrupt) and wait for the user to confirm the
+    deletion. The frontend resumes the run with forwarded_props.command.resume
+    set to "YES" or "NO".
     """
-    return state
+    tool_call = _find_delete_call(state)
+    urls = tool_call["args"].get("urls", []) if tool_call else []
+    answer = interrupt({"action": "confirm_delete", "urls": urls})
+    return {"delete_confirmation": str(answer)}
 
 
 async def perform_delete_node(state: AgentState, config: RunnableConfig):  # pylint: disable=unused-argument
     """
-    Perform Delete Node
+    Apply (or skip) the deletion the user answered in delete_node, and close
+    the pending DeleteResources tool call so the next LLM turn is valid.
     """
-    ai_message = cast(AIMessage, state["messages"][-2])
-    tool_message = cast(ToolMessage, state["messages"][-1])
-    if tool_message.content == "YES":
-        if ai_message.tool_calls:
-            urls = ai_message.tool_calls[0]["args"]["urls"]
-        else:
-            parsed_tool_call = json.loads(
-                ai_message.additional_kwargs["function_call"]["arguments"]
-            )
-            urls = parsed_tool_call["urls"]
+    tool_call = _find_delete_call(state)
+    if tool_call is None:
+        return state
 
-        state["resources"] = [
-            resource for resource in state["resources"] if resource["url"] not in urls
-        ]
+    urls = tool_call["args"].get("urls", [])
+    confirmed = str(state.get("delete_confirmation", "")).strip().upper() == "YES"
 
-    return state
+    resources = state.get("resources", [])
+    if confirmed:
+        resources = [r for r in resources if r["url"] not in urls]
+        result = f"Deleted {len(urls)} resource(s) as confirmed by the user. Tell the user the deletion is done."
+    else:
+        result = "The user declined the deletion. Resources were kept unchanged. Tell the user nothing was deleted."
+
+    return {
+        "resources": resources,
+        "messages": [ToolMessage(tool_call_id=tool_call["id"], content=result)],
+    }

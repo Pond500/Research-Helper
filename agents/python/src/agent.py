@@ -36,7 +36,9 @@ workflow.add_edge("search_node", "download")
 
 # Conditionally use a checkpointer based on the environment
 # This allows compatibility with both LangGraph API and CopilotKit
-compile_kwargs = {"interrupt_after": ["delete_node"]}
+# (delete confirmation uses a dynamic interrupt() inside delete_node,
+#  resumed via forwarded_props.command.resume — no static breakpoint needed)
+compile_kwargs = {}
 
 
 # Check if we're running in LangGraph API mode

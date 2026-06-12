@@ -62,8 +62,8 @@ def _auto_inject_citations(
 ) -> Tuple[str, Dict[str, dict]]:
     """
     Match numbers from resources against the report, inject [N] markers inline.
-    Three strategies in order: extracted facts → content numerics → title keywords → guaranteed.
-    Returns (annotated_report, citations_dict).
+    Two strategies in order: extracted facts → content numerics. Both verify the
+    cited resource actually contains the number. Returns (annotated_report, citations_dict).
     """
     report_lower = report.lower()
     value_to_n: Dict[str, int] = {}  # display_string → 1-based resource index
@@ -99,36 +99,9 @@ def _auto_inject_citations(
                 if val_display not in value_to_n:
                     value_to_n[val_display] = i + 1
 
-    # ── Strategy C: title keyword match → inject after nearest number ──
-    if not value_to_n:
-        for i, resource in enumerate(resources[:15]):
-            title = resource.get("title", resource.get("source", ""))
-            # Use longest word from title (≥5 chars) as anchor
-            keywords = sorted(
-                [w.lower() for w in re.split(r'\W+', title) if len(w) >= 5],
-                key=len, reverse=True
-            )[:3]
-            for kw in keywords:
-                if kw in report_lower:
-                    # find the nearest number after the keyword position
-                    kw_pos = report_lower.find(kw)
-                    nearby = report[kw_pos:kw_pos + 300]
-                    m = re.search(r'\d+\.?\d*\s*%|\d+[.,]\d+|\d{3,}', nearby)
-                    if m:
-                        val_str = m.group(0).strip()
-                        if val_str not in value_to_n:
-                            value_to_n[val_str] = i + 1
-                    break
-
-    # ── Strategy D (guaranteed): pair first non-year numbers in report with top resources ──
-    if not value_to_n and resources:
-        num_matches = list(re.finditer(r'\d+\.?\d*\s*%|\d+[.,]\d+|\b\d{3,}\b', report))
-        non_year = [m for m in num_matches if not re.fullmatch(r'(?:19|20)\d{2}', m.group(0).strip())]
-        candidates = non_year if non_year else num_matches
-        for j, m in enumerate(candidates[:min(4, len(resources))]):
-            val_str = m.group(0).strip()
-            if val_str not in value_to_n:
-                value_to_n[val_str] = j + 1
+    # Strategies that guessed attributions without verifying the source actually
+    # contains the number (title-keyword proximity, forced pairing) were removed:
+    # a wrong citation is worse than no citation.
 
     if not value_to_n:
         return report, {}
@@ -164,6 +137,79 @@ def _auto_inject_citations(
     return annotated, citations
 
 
+def _detect_user_language(messages) -> str:
+    """Language of the last non-empty human message: Thai script → Thai, else English."""
+    for m in reversed(messages):
+        if getattr(m, "type", "") == "human":
+            text = str(getattr(m, "content", "") or "").strip()
+            if text:
+                return "Thai" if re.search(r"[\u0e00-\u0e7f]", text) else "English"
+    return "Thai"
+
+
+_MARKER_RE = re.compile(r"\[(\d+)\]")
+
+
+def _normalize_num(s: str) -> str:
+    return re.sub(r"[%$,\s]", "", s)
+
+
+def _verify_llm_citations(
+    report: str, resources: List[dict]
+) -> Tuple[str, Dict[str, dict]]:
+    """
+    Validate [N] markers the LLM wrote. For each marker preceded (on the same line)
+    by a number, the cited resource's content must actually contain that number —
+    otherwise remap the marker to a resource that does, or drop it entirely.
+    Markers without a preceding number (e.g. the source-index footer) are left alone.
+    Returns (cleaned_report, citations_dict).
+    """
+    contents = [
+        _normalize_num(r.get("content", "") or r.get("description", ""))
+        for r in resources
+    ]
+
+    out: List[str] = []
+    last = 0
+    for m in _MARKER_RE.finditer(report):
+        n = int(m.group(1))
+        # Number candidates on the same line, just before the marker
+        context = report[max(0, m.start() - 60):m.start()].split("\n")[-1]
+        nums = re.findall(r"[\$]?\d[\d,\.]*\s*%?", context)
+        cand = None
+        for s in reversed(nums):
+            core = _normalize_num(s).rstrip(".")
+            if re.fullmatch(r"(?:19|20)\d\d", core):  # bare years prove nothing
+                continue
+            cand = core
+            break
+
+        out.append(report[last:m.start()])
+        if cand is None:
+            out.append(m.group(0))  # nothing to verify against → keep as-is
+        elif 0 <= n - 1 < len(contents) and cand in contents[n - 1]:
+            out.append(m.group(0))  # attribution verified
+        else:
+            j = next((k for k, c in enumerate(contents) if cand in c), None)
+            out.append(f"[{j + 1}]" if j is not None else "")  # remap or drop
+        last = m.end()
+    out.append(report[last:])
+    cleaned = "".join(out)
+
+    citations: Dict[str, dict] = {}
+    for m in _MARKER_RE.finditer(cleaned):
+        n = int(m.group(1))
+        if 0 <= n - 1 < len(resources) and str(n) not in citations:
+            r = resources[n - 1]
+            raw = r.get("content", "") or r.get("description", "")
+            citations[str(n)] = {
+                "url": r.get("url", ""),
+                "title": r.get("title", ""),
+                "snippet": raw[:300].strip(),
+            }
+    return cleaned, citations
+
+
 async def chat_node(
     state: AgentState, config: RunnableConfig
 ) -> Command[Literal["search_node", "chat_node", "delete_node", "__end__"]]:
@@ -171,6 +217,16 @@ async def chat_node(
     Chat Node
     """
     logger.info("=== CHAT_NODE: Starting execution ===")
+
+    # Guard: no actual user input → ask what to research instead of self-driving a run
+    has_user_input = any(
+        getattr(m, "type", "") == "human" and str(getattr(m, "content", "") or "").strip()
+        for m in state.get("messages", [])
+    )
+    if not has_user_input:
+        return Command(goto="__end__", update={"messages": [AIMessage(
+            content="สวัสดีครับ อยากให้ช่วยค้นคว้าเรื่องอะไรดีครับ? / Hi! What would you like me to research?"
+        )]})
 
     state["resources"] = state.get("resources", [])
     research_question = state.get("research_question", "")
@@ -227,12 +283,17 @@ async def chat_node(
                 period = f" ({f.get('period')})" if f.get("period") else ""
                 data_context += f"  • {f.get('entity')}: {f.get('metric')} = {f.get('value')}{period}\n"
 
-    system_prompt = f"""คุณคือนักวิจัยอัจฉริยะและนักวิทยาศาสตร์ข้อมูลระดับเชี่ยวชาญ มีหน้าที่สร้างรายงานวิจัยเชิงลึกพร้อมการวิเคราะห์เชิงตัวเลขและภาพข้อมูลที่น่าประทับใจ
+    user_language = _detect_user_language(state["messages"])
+
+    system_prompt = f"""MANDATORY OUTPUT LANGUAGE: {user_language}
+Every reply, every section of the report, all headings and chart explanations MUST be written in {user_language}. This overrides everything below.
+
+คุณคือนักวิจัยอัจฉริยะและนักวิทยาศาสตร์ข้อมูลระดับเชี่ยวชาญ มีหน้าที่สร้างรายงานวิจัยเชิงลึกพร้อมการวิเคราะห์เชิงตัวเลขและภาพข้อมูลที่น่าประทับใจ
 
 ══════════════════════════════════════
 ภาษา / LANGUAGE
 ══════════════════════════════════════
-- ตอบ สื่อสาร และเขียนรายงาน: ภาษาไทยเท่านั้น
+- ตอบ สื่อสาร และเขียนรายงาน: เป็นภาษา {user_language} เท่านั้น (ภาษาของผู้ใช้)
 - Search queries และ tool arguments: ภาษาอังกฤษเท่านั้น (เพื่อให้ได้ผลลัพธ์ที่ดีที่สุด)
 
 ══════════════════════════════════════
@@ -265,7 +326,7 @@ async def chat_node(
 
 4. VISUALIZE DATA — หลังได้ข้อมูลตัวเลขแล้ว ต้องเรียก GeneratePlotlyChart อย่างน้อย 1 ครั้ง (ดูกฎด้านล่าง)
 5. STRUCTURED COMPONENTS — เรียก GenerateA2UIComponent เพื่อแสดงตัวเลขสำคัญและตารางเปรียบเทียบ
-6. WRITE REPORT — เรียก WriteReport เพื่อเขียนรายงานฉบับสมบูรณ์เป็นภาษาไทย ใช้เฉพาะตัวเลขที่ได้จาก search/scrape เท่านั้น ห้าม hallucinate ปีที่ไม่มีข้อมูล
+6. WRITE REPORT — เรียก WriteReport เพื่อเขียนรายงานฉบับสมบูรณ์เป็นภาษาเดียวกับผู้ใช้ ใช้เฉพาะตัวเลขที่ได้จาก search/scrape เท่านั้น ห้าม hallucinate ปีที่ไม่มีข้อมูล
 7. FOLLOW UP — ส่งข้อความสั้น 1-2 ประโยค ถามว่าอยากให้ปรับอะไรเพิ่มเติม
 
 ══════════════════════════════════════
@@ -320,9 +381,9 @@ async def chat_node(
 ══════════════════════════════════════
 การอ้างอิงแหล่งข้อมูล (INLINE CITATIONS — บังคับทำทุกครั้ง)
 ══════════════════════════════════════
-▸ ต้องใส่ [N] ต่อท้ายตัวเลขและสถิติทุกตัวในรายงาน ห้ามข้าม
-▸ N คือหมายเลขใน "ดัชนีแหล่งข้อมูล" ด้านล่าง — ดูว่า source ไหนมีข้อมูลนั้น แล้วใช้หมายเลขนั้น
-▸ ถ้าไม่แน่ใจว่า source ไหน → ใช้ [1] ก็ได้ แต่ต้องใส่เสมอ
+▸ ใส่ [N] ต่อท้ายตัวเลขและสถิติในรายงาน
+▸ N คือหมายเลขใน "ดัชนีแหล่งข้อมูล" ด้านล่าง — ใช้ [N] เฉพาะเมื่อ source หมายเลขนั้นมีตัวเลข/ข้อเท็จจริงนั้นอยู่จริง
+▸ ถ้าไม่แน่ใจว่าตัวเลขมาจาก source ไหน → ห้ามเดาหมายเลข ให้ละ [N] ไว้สำหรับตัวเลขนั้น
 ▸ ไม่ต้องมีช่องว่างก่อน [N] เช่น: "เติบโต 2.5%[1]" หรือ "มูลค่า 500 พันล้าน[2]"
 ▸ ตัวอย่าง: "GDP เติบโต 2.5%[1] ขณะที่ CPI อยู่ที่ 3.2%[2] และ FDI รวม $45B[1]"
 
@@ -349,6 +410,7 @@ async def chat_node(
             GeneratePlotlyChart,
             GenerateA2UIComponent,
             DeepScrapeWebsite,
+            DeleteResources,
         ],
         **ainvoke_kwargs,
     ).ainvoke(
@@ -471,37 +533,26 @@ async def chat_node(
                     resources_list = resources  # use content-enriched local var
                     extracted_facts = state.get("extracted_numerics", [])
 
-                    logger.warning(
-                        f"[citations-debug] resources_list len={len(resources_list)}, "
-                        f"extracted_facts len={len(extracted_facts)}, "
-                        f"report_len={len(state['report'])}, "
-                        f"first_resource_content_len={len(resources_list[0].get('content','') or '') if resources_list else 0}"
-                    )
-
-                    # Check if LLM added its own [N] markers
-                    llm_cited = set(int(m) for m in re.findall(r'\[(\d+)\]', state["report"]))
-
-                    if llm_cited:
-                        # Trust LLM markers — build citations from those
-                        citations: dict = {}
-                        for n in llm_cited:
-                            idx = n - 1
-                            if 0 <= idx < len(resources_list):
-                                r = resources_list[idx]
-                                raw = r.get("content", "") or r.get("description", "")
-                                citations[str(n)] = {
-                                    "url": r.get("url", ""),
-                                    "title": r.get("title", ""),
-                                    "snippet": raw[:300].strip(),
-                                }
-                        state["citations"] = citations
-                        logger.warning(f"[citations-debug] LLM added {len(llm_cited)} markers → citations={list(citations.keys())}")
+                    if _MARKER_RE.search(state["report"]):
+                        # LLM added its own [N] markers — verify each against source content
+                        state["report"], state["citations"] = _verify_llm_citations(
+                            state["report"], resources_list
+                        )
                     else:
                         # Auto-inject: match extracted fact values against resource content
                         state["report"], state["citations"] = _auto_inject_citations(
                             state["report"], extracted_facts, resources_list
                         )
-                        logger.warning(f"[citations-debug] auto-inject → {len(state['citations'])} citations: {list(state['citations'].keys())}")
+
+                    # Charts must survive report rewrites (critic retries tended to
+                    # drop the inline markers) — re-append any chart not referenced.
+                    charts = state.get("charts", [])
+                    missing_markers = [
+                        f"[CHART:{c['id']}]" for c in charts
+                        if f"[CHART:{c['id']}]" not in state["report"]
+                    ]
+                    if missing_markers:
+                        state["report"] += "\n\n" + "\n\n".join(missing_markers)
 
                     goto_node = "critic_node"
                     

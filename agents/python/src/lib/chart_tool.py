@@ -91,6 +91,43 @@ def _base(title: str, source: Optional[str]) -> dict:
     return base
 
 
+def _numeric_max(values: List[Any]) -> float:
+    nums = [abs(v) for v in values if isinstance(v, (int, float))]
+    return float(max(nums)) if nums else 0.0
+
+
+def _maybe_dual_axis(
+    opt: dict, series: List[Any], y_axis_secondary_name: Optional[str]
+) -> dict:
+    """
+    Series with wildly different scales (e.g. GDP in $B vs GDP per capita in $)
+    flatten the smaller one when sharing a y-axis — move outliers (≥8× scale
+    difference vs the first series) onto an auto-added secondary axis.
+    """
+    SCALE_RATIO = 8
+    y_axis = opt.get("yAxis")
+    if len(series) < 2 or not isinstance(y_axis, dict) or y_axis.get("type") != "value":
+        return opt
+    maxes = [_numeric_max(s.values) for s in series]
+    nonzero = [m for m in maxes if m > 0]
+    if len(nonzero) < 2 or max(nonzero) / min(nonzero) < SCALE_RATIO:
+        return opt
+
+    ref = next((m for m in maxes if m > 0), 0.0)
+    base_axis = opt["yAxis"]
+    secondary = {
+        **base_axis,
+        "name": y_axis_secondary_name or "",
+        "splitLine": {"show": False},
+    }
+    opt["yAxis"] = [base_axis, secondary]
+    for i, ser_cfg in enumerate(opt.get("series", [])):
+        m = maxes[i] if i < len(maxes) else 0.0
+        if m > 0 and (m / ref >= SCALE_RATIO or ref / m >= SCALE_RATIO):
+            ser_cfg["yAxisIndex"] = 1
+    return opt
+
+
 def _build_option(
     chart_type: str,
     title: str,
@@ -156,7 +193,7 @@ def _build_option(
             if chart_type == "area":
                 ser["areaStyle"] = {"color": _grad(color, "55", "05")}
             opt["series"].append(ser)
-        return opt
+        return _maybe_dual_axis(opt, series, y_axis_secondary_name)
 
     # BAR / HORIZONTAL_BAR
     if chart_type in ("bar", "horizontal_bar"):
@@ -214,7 +251,7 @@ def _build_option(
                     "label": {"color": "#111827"},
                 },
             })
-        return opt
+        return _maybe_dual_axis(opt, series, y_axis_secondary_name)
 
     # PIE / DONUT
     if chart_type in ("pie", "donut"):
@@ -578,7 +615,11 @@ class GeneratePlotlyChartInput(BaseModel):
     ))
     title: str = Field(description="Short descriptive chart title.")
     x_axis: Optional[List[str]] = Field(default=None, description="X-axis category labels or names.")
-    series: List[SeriesData] = Field(description="Data series list. Each has a name and a values array.")
+    series: List[SeriesData] = Field(description=(
+        "Data series list. Each has a name and a values array. "
+        "Use null (NOT 0) for periods with no data — a 0 draws a misleading plunge to zero, "
+        "null leaves a gap. All series should align with x_axis positions."
+    ))
     y_axis_name: Optional[str] = Field(default=None, description="Left Y-axis label.")
     y_axis_secondary_name: Optional[str] = Field(default=None,
         description="Right Y-axis label — only for combination charts with two scales.")

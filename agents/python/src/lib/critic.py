@@ -16,7 +16,7 @@ class CriticEvaluation(BaseModel):
     feedback: str = Field(description="If is_pass is False, provide strict feedback and a specific Search Query the agent should use to find the missing data. If True, just say 'Approved'.")
 
 class FollowUpQuestions(BaseModel):
-    questions: List[str] = Field(description="Exactly 3 follow-up research questions the user might want to explore next, in Thai language.")
+    questions: List[str] = Field(description="Exactly 3 follow-up research questions the user might want to explore next, written in the same language as the research question.")
 
 async def critic_node(state: AgentState, config: RunnableConfig) -> Command[Literal["chat_node", "__end__"]]:
     """
@@ -94,7 +94,8 @@ Output your evaluation using the CriticEvaluation tool."""
                 [
                     SystemMessage(content=(
                         "คุณคือผู้ช่วยวิจัยที่ช่วยแนะนำคำถามติดตาม "
-                        "จากรายงานวิจัยที่เพิ่งเสร็จ สร้างคำถามเป็นภาษาไทย 3 ข้อ "
+                        "จากรายงานวิจัยที่เพิ่งเสร็จ สร้างคำถาม 3 ข้อ "
+                        "เป็นภาษาเดียวกับคำถามวิจัยหลัก "
                         "ที่น่าสนใจและต่อยอดจากรายงานนี้ได้ดี "
                         "แต่ละคำถามควรเจาะจงและนำไปวิจัยต่อได้ทันที"
                     )),
@@ -124,7 +125,12 @@ Output your evaluation using the CriticEvaluation tool."""
         if hasattr(last_ai_msg, "tool_calls") and last_ai_msg.tool_calls:
             for i, call in enumerate(last_ai_msg.tool_calls):
                 if call["name"] == "WriteReport":
-                    content = f"CRITIC REJECTED YOUR REPORT. Reason: {evaluation.feedback}\n\nYou MUST use GeneratePlotlyChart or Search to fix this and rewrite the report."
+                    content = (
+                        f"CRITIC REJECTED YOUR REPORT. Reason: {evaluation.feedback}\n\n"
+                        "You MUST use GeneratePlotlyChart or Search to fix this and rewrite the report.\n"
+                        "When rewriting, you MUST keep every [CHART:id] marker and every [N] citation marker "
+                        "from the previous version in place, and keep the report in the same language as the user's question."
+                    )
                 else:
                     content = "Tool call ignored because WriteReport was rejected."
                 tool_messages.append(ToolMessage(tool_call_id=call["id"], content=content))

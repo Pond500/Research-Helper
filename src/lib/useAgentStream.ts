@@ -118,6 +118,8 @@ export function useAgentStream({
       setAgentState(currentState);
 
       let gotRunFinished = false;
+      let wasAborted = false;
+      let sawInterrupt = false;
       let currentMsgId = '';
       let currentMsgContent = '';
       let currentToolCallId = '';
@@ -225,6 +227,21 @@ export function useAgentStream({
                   setCurrentStep(undefined);
                   break;
 
+                case 'CUSTOM': {
+                  // LangGraph dynamic interrupt — delete confirmation request
+                  if (ev.name === 'on_interrupt') {
+                    let v = ev.value;
+                    if (typeof v === 'string') {
+                      try { v = JSON.parse(v); } catch { v = {}; }
+                    }
+                    if (v && v.action === 'confirm_delete') {
+                      sawInterrupt = true;
+                      setPendingDeleteUrls((v.urls as string[]) ?? []);
+                    }
+                  }
+                  break;
+                }
+
                 case 'RUN_FINISHED':
                   gotRunFinished = true;
                   setCurrentStep(undefined);
@@ -246,20 +263,31 @@ export function useAgentStream({
           }
         }
       } catch (e: unknown) {
-        if ((e as Error).name !== 'AbortError') console.error('[useAgentStream] error:', e);
+        if ((e as Error).name === 'AbortError') wasAborted = true;
+        else console.error('[useAgentStream] error:', e);
       } finally {
         setIsRunning(false);
-        if (!gotRunFinished) {
-          // Stream ended without RUN_FINISHED → graph interrupted
-          // Check if waiting for delete confirmation
-          const allMsgs = messagesRef.current;
-          const lastAiMsg = [...allMsgs]
-            .reverse()
-            .find((m) => m.role === 'assistant' && m.toolCalls?.length);
-          const deleteCall = lastAiMsg?.toolCalls?.find((tc) => tc.name === 'DeleteResources');
-          if (deleteCall) {
-            setPendingDeleteUrls((deleteCall.args.urls as string[]) ?? []);
-          }
+        if (gotRunFinished && !sawInterrupt) {
+          // Start every turn on a fresh thread. The full visible conversation
+          // and agent state are re-sent each run, so no context is lost — and
+          // it sidesteps ag_ui_langgraph's regenerate heuristic, which crashes
+          // ("Message ID not found in history") when the server thread holds
+          // tool messages the client never sees (i.e. after every research
+          // run). Interrupted runs keep their thread so the resume can land.
+          threadIdRef.current = `thread-${Date.now()}`;
+        }
+        if (!gotRunFinished && !wasAborted) {
+          // Interrupts now arrive as CUSTOM on_interrupt events followed by a
+          // proper RUN_FINISHED — a stream ending without one is a dropped
+          // connection, so tell the user instead of failing silently.
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: `err-${Date.now()}`,
+              role: 'error' as const,
+              content: 'การเชื่อมต่อกับ agent ถูกตัดระหว่างประมวลผล โปรดลองส่งข้อความอีกครั้ง',
+            },
+          ]);
         }
       }
     },
@@ -272,7 +300,9 @@ export function useAgentStream({
       const updated = [...messagesRef.current, userMsg];
       setMessages(updated);
       runStream(
-        updated.map((m) => ({ id: m.id, role: m.role, content: m.content })),
+        updated
+          .filter((m) => m.role !== 'error') // error bubbles are UI-only, not a valid chat role
+          .map((m) => ({ id: m.id, role: m.role, content: m.content })),
         undefined,
         stateOverride,
       );
@@ -284,21 +314,9 @@ export function useAgentStream({
     (confirmed: boolean) => {
       if (pendingDeleteUrls === null) return;
       setPendingDeleteUrls(null);
-
-      const allMsgs = messagesRef.current;
-      const lastAiMsg = [...allMsgs]
-        .reverse()
-        .find((m) => m.role === 'assistant' && m.toolCalls?.some((tc) => tc.name === 'DeleteResources'));
-      const deleteCall = lastAiMsg?.toolCalls?.find((tc) => tc.name === 'DeleteResources');
-
-      // Send a tool response message that perform_delete_node will read as messages[-1]
-      const toolMsg = {
-        id: `tool-${Date.now()}`,
-        role: 'tool',
-        content: confirmed ? 'YES' : 'NO',
-        ...(deleteCall ? { tool_call_id: deleteCall.id } : {}),
-      };
-      runStream([toolMsg], { resume_value: confirmed ? 'YES' : 'NO' }, undefined);
+      // Resume the LangGraph interrupt. The agent closes the pending tool
+      // call itself, so no messages are sent with the resume command.
+      runStream([], { command: { resume: confirmed ? 'YES' : 'NO' } }, undefined);
     },
     [pendingDeleteUrls, runStream],
   );
@@ -306,6 +324,11 @@ export function useAgentStream({
   const stop = useCallback(() => {
     abortRef.current?.abort();
     setIsRunning(false);
+    // The aborted run leaves the server-side thread with partial history that
+    // rejects follow-up messages ("Message ID not found in history").
+    // Start a fresh thread — the full visible conversation is re-sent on every
+    // run anyway, so context is preserved.
+    threadIdRef.current = `thread-${Date.now()}`;
   }, []);
 
   const updateAgentState = useCallback((updates: Partial<AgentState>) => {

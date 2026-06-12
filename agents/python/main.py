@@ -4,13 +4,18 @@ Research Agent Server
 FastAPI server that exposes a LangGraph research agent via CopilotKit.
 """
 
+import asyncio
+import logging
 import os
 
 import uvicorn
-from ag_ui_langgraph import LangGraphAgent, add_langgraph_fastapi_endpoint
+from ag_ui.core import EventType, RunAgentInput, RunErrorEvent
+from ag_ui.encoder import EventEncoder
+from ag_ui_langgraph import LangGraphAgent
 from dotenv import load_dotenv
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import tempfile
 from langchain_community.document_loaders import PyPDFLoader, TextLoader, Docx2txtLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -30,15 +35,63 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-add_langgraph_fastapi_endpoint(
-    app=app,
-    agent=LangGraphAgent(
-        name="research_agent",
-        description="AI research assistant for gathering and analyzing information.",
-        graph=graph,
-    ),
-    path="/copilotkit/agents/research_agent",
+logger = logging.getLogger("research_agent")
+
+agent = LangGraphAgent(
+    name="research_agent",
+    description="AI research assistant for gathering and analyzing information.",
+    graph=graph,
 )
+
+HEARTBEAT_SECONDS = 15
+_STREAM_DONE = object()
+
+
+@app.post("/copilotkit/agents/research_agent")
+async def research_agent_endpoint(input_data: RunAgentInput, request: Request):
+    """
+    Same contract as ag_ui_langgraph.add_langgraph_fastapi_endpoint, plus:
+    - SSE keepalive comments while the agent is silent (proxies/clients kill
+      idle streams — undici/Next.js default is 300s)
+    - agent exceptions become a RUN_ERROR event instead of crashing the
+      response mid-stream, so the frontend can show the failure
+    """
+    accept_header = request.headers.get("accept")
+    encoder = EventEncoder(accept=accept_header)
+    is_sse = "text/event-stream" in (accept_header or "text/event-stream")
+
+    async def event_generator():
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def pump():
+            try:
+                async for event in agent.run(input_data):
+                    await queue.put(encoder.encode(event))
+            except Exception as exc:  # noqa: BLE001 — surface every failure to the client
+                logger.exception("Agent run failed")
+                await queue.put(encoder.encode(RunErrorEvent(
+                    type=EventType.RUN_ERROR,
+                    message=f"Agent error: {exc}",
+                )))
+            finally:
+                await queue.put(_STREAM_DONE)
+
+        task = asyncio.create_task(pump())
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=HEARTBEAT_SECONDS)
+                except asyncio.TimeoutError:
+                    if is_sse:
+                        yield ": keepalive\n\n"
+                    continue
+                if item is _STREAM_DONE:
+                    break
+                yield item
+        finally:
+            task.cancel()
+
+    return StreamingResponse(event_generator(), media_type=encoder.get_content_type())
 
 
 @app.get("/health")
