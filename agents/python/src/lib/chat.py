@@ -2,6 +2,7 @@
 
 import logging
 import re
+from datetime import date
 from typing import Dict, List, Literal, Tuple, cast
 
 from langchain.tools import tool
@@ -135,6 +136,74 @@ def _auto_inject_citations(
                 }
 
     return annotated, citations
+
+
+# ── Chart grounding guard ────────────────────────────────────────────────────
+# Charts must be drawn from numbers that actually exist in the gathered
+# sources — the model otherwise interpolates smooth fakes (e.g. revenue
+# "10, 20, 30, 50, 100" instead of the real figures).
+
+_GROUNDING_SCALES = (1.0, 1e3, 1e6, 1e-3, 1e-6)  # tolerate unit conversions
+_GROUNDING_TOLERANCE = 0.02
+_MAX_CHART_REJECTS = 2
+
+
+def _corpus_numbers(resources: List[dict], extracted_facts: List[dict], chart_datasets: List[dict]) -> List[float]:
+    """Every number available from sources/extraction, as floats."""
+    texts = [
+        (r.get("content", "") or "") + " " + (r.get("description", "") or "")
+        for r in resources
+    ]
+    texts.extend(str(f.get("value", "")) for f in extracted_facts or [])
+    for ds in chart_datasets or []:
+        for s in ds.get("series", []):
+            texts.append(" ".join(str(v) for v in (s.get("values") or [])))
+    nums: set = set()
+    for t in texts:
+        for m in re.finditer(r"-?\d[\d,]*\.?\d*", t):
+            try:
+                nums.add(float(m.group(0).replace(",", "")))
+            except ValueError:
+                continue
+    return list(nums)
+
+
+_METRIC_LABEL_RE = re.compile(
+    r"(growth|inflation|current prices|percent of|share of|balance|net lending"
+    r"|gross debt|\brate\b|\bindex\b|per capita|unemployment|account)",
+    re.I,
+)
+
+
+def _x_axis_is_metric_list(x_axis) -> bool:
+    """True when x categories are metric names (a table copied sideways),
+    e.g. ['Real GDP growth', 'Inflation rate', ...] instead of entities/years."""
+    labels = [str(x) for x in (x_axis or [])]
+    if len(labels) < 3:
+        return False
+    hits = sum(1 for x in labels if _METRIC_LABEL_RE.search(x))
+    return hits >= max(3, len(labels) // 2)
+
+
+def _chart_grounding(series: List[dict], corpus: List[float]) -> Tuple[int, int]:
+    """Return (grounded, checked) chart values matched against source numbers
+    within tolerance at common unit scales (millions vs billions etc.)."""
+    grounded = checked = 0
+    for s in series or []:
+        for v in (s or {}).get("values") or []:
+            vals = [x for x in v if isinstance(x, (int, float))] if isinstance(v, list) \
+                else ([v] if isinstance(v, (int, float)) else [])
+            for x in vals:
+                if abs(x) < 1:  # tiny values match too easily to verify
+                    continue
+                checked += 1
+                if any(
+                    abs(c - x * sc) <= _GROUNDING_TOLERANCE * abs(x * sc)
+                    for sc in _GROUNDING_SCALES
+                    for c in corpus
+                ):
+                    grounded += 1
+    return grounded, checked
 
 
 def _detect_user_language(messages) -> str:
@@ -284,9 +353,12 @@ async def chat_node(
                 data_context += f"  • {f.get('entity')}: {f.get('metric')} = {f.get('value')}{period}\n"
 
     user_language = _detect_user_language(state["messages"])
+    today = date.today()
 
     system_prompt = f"""MANDATORY OUTPUT LANGUAGE: {user_language}
 Every reply, every section of the report, all headings and chart explanations MUST be written in {user_language}. This overrides everything below.
+
+TODAY'S DATE: {today.isoformat()} (พ.ศ. {today.year + 543}) — the current year is {today.year}.
 
 คุณคือนักวิจัยอัจฉริยะและนักวิทยาศาสตร์ข้อมูลระดับเชี่ยวชาญ มีหน้าที่สร้างรายงานวิจัยเชิงลึกพร้อมการวิเคราะห์เชิงตัวเลขและภาพข้อมูลที่น่าประทับใจ
 
@@ -311,6 +383,11 @@ Every reply, every section of the report, all headings and chart explanations MU
      เช่น "top selling EV brands Thailand 2025 ranking list"
    • ห้ามส่งแค่ query ระดับรวม (aggregate) เช่น "EV market share Thailand" โดยไม่มี breakdown query คู่
 
+   ⚠️ คำถามอิงเวลาปัจจุบัน ("ตอนนี้", "ช่วงนี้", "ล่าสุด", "current", "now", "today") — กฎบังคับ:
+   • ต้องใส่ปี {today.year} ใน search queries เสมอ (เช่น "gold price {today.year}")
+   • ตรวจวันที่ของข้อมูลที่ได้ — ถ้าข้อมูลล่าสุดที่หาได้เก่ากว่าปัจจุบันมาก ต้องบอกผู้อ่านชัดเจนว่าเป็นข้อมูล ณ วันที่ใด ห้ามนำเสนอข้อมูลเก่าราวกับเป็นข้อมูลปัจจุบัน
+   • ระบุวันที่/ช่วงเวลาของข้อมูลในรายงานและชื่อกราฟเสมอ
+
    ⚠️ ถ้าคำถามระบุช่วงปี (เช่น 2018–2024) — กฎบังคับ:
    • ต้องใส่ปีทุกปีในช่วงนั้นใน query เสมอ เช่น "G7 GDP growth 2018 2019 2020 2021 2022 2023 2024"
    • ต้องเพิ่ม query ที่เจาะ historical data โดยตรง เช่น:
@@ -334,6 +411,11 @@ Every reply, every section of the report, all headings and chart explanations MU
 ══════════════════════════════════════
 ▸ MANDATORY: ถ้าหัวข้อมีสถิติ, ตัวเลข, การเปรียบเทียบ, หรือแนวโน้ม → ต้องสร้างกราฟเสมอ ห้ามรอให้ผู้ใช้ขอ
 ▸ ถ้ามี CHART-READY DATASETS ใน "📊 ข้อมูลจริง" ด้านล่าง → ต้องใช้ค่าเหล่านั้นโดยตรงใน GeneratePlotlyChart ห้าม hallucinate ตัวเลข
+▸ ตัวเลขทุกตัวในกราฟต้องมาจาก search results เป๊ะ ๆ — ห้ามปัดเป็นเลขกลม ห้าม interpolate เติมปีที่ไม่มีข้อมูล (ระบบจะตรวจและปฏิเสธกราฟที่ตัวเลขไม่ตรงแหล่ง)
+▸ ใส่เฉพาะ entity ที่ผู้ใช้ถามเท่านั้น — ถ้าคำถามระบุกลุ่ม (เช่น ASEAN, G7, EU) ให้กรองข้อมูลเหลือเฉพาะสมาชิกของกลุ่มนั้น ห้ามลอกทั้งตารางจากแหล่งมาทั้งดุ้น
+▸ แกน x ต้องเป็นชื่อ entity (ประเทศ/บริษัท/แบรนด์) หรือช่วงเวลา (ปี/เดือน) เท่านั้น — หนึ่งกราฟต่อหนึ่ง metric ห้ามเอาชื่อ metric หลายตัว (เช่น "Real GDP growth", "Inflation rate") มาเรียงเป็นแกน x ในกราฟเดียว
+▸ ค่าของปีอนาคตหรือค่าคาดการณ์ ต้องระบุในชื่อกราฟหรือชื่อ series ว่า "(คาดการณ์)" / "(forecast)" ให้ชัดเจน
+▸ สร้างกราฟแต่ละเรื่องเพียงครั้งเดียว — ห้ามสร้างกราฟชื่อเดิมหรือข้อมูลเดิมซ้ำ ถ้า tool บอกว่ากราฟมีอยู่แล้วให้ใช้ marker เดิม
 ▸ หลังเรียก GeneratePlotlyChart แล้ว tool จะคืน marker เช่น [CHART:abc12345] → ต้องวาง marker นั้นในรายงานตรงตำแหน่งที่ต้องการแสดงกราฟทุกครั้ง ห้ามแต่งหรือเดา chart ID เอง
 
 เลือกประเภทกราฟตามข้อมูล:
@@ -381,9 +463,9 @@ Every reply, every section of the report, all headings and chart explanations MU
 ══════════════════════════════════════
 การอ้างอิงแหล่งข้อมูล (INLINE CITATIONS — บังคับทำทุกครั้ง)
 ══════════════════════════════════════
-▸ ใส่ [N] ต่อท้ายตัวเลขและสถิติในรายงาน
+▸ ใส่ [N] ต่อท้ายตัวเลขและสถิติในรายงาน — ทุกย่อหน้าหรือบูลเล็ตที่มีตัวเลขสำคัญ ต้องมี [N] กำกับอย่างน้อยหนึ่งจุด
 ▸ N คือหมายเลขใน "ดัชนีแหล่งข้อมูล" ด้านล่าง — ใช้ [N] เฉพาะเมื่อ source หมายเลขนั้นมีตัวเลข/ข้อเท็จจริงนั้นอยู่จริง
-▸ ถ้าไม่แน่ใจว่าตัวเลขมาจาก source ไหน → ห้ามเดาหมายเลข ให้ละ [N] ไว้สำหรับตัวเลขนั้น
+▸ ถ้าไม่แน่ใจว่าตัวเลขมาจาก source ไหน → ห้ามเดาหมายเลข ให้ละ [N] ไว้เฉพาะตัวเลขนั้นแล้วอ้างตัวเลขอื่นที่แน่ใจตามปกติ
 ▸ ไม่ต้องมีช่องว่างก่อน [N] เช่น: "เติบโต 2.5%[1]" หรือ "มูลค่า 500 พันล้าน[2]"
 ▸ ตัวอย่าง: "GDP เติบโต 2.5%[1] ขณะที่ CPI อยู่ที่ 3.2%[2] และ FDI รวม $45B[1]"
 
@@ -440,6 +522,49 @@ Every reply, every section of the report, all headings and chart explanations MU
             elif name == "GeneratePlotlyChart":
                 try:
                     import json as _json_chart
+
+                    # ── Structure guard: x-axis must be entities/periods, not metric names ──
+                    rejects = state.get("chart_reject_count", 0)
+                    if rejects < _MAX_CHART_REJECTS and _x_axis_is_metric_list(call["args"].get("x_axis")):
+                        state["chart_reject_count"] = rejects + 1
+                        title_preview = str(call["args"].get("title", ""))[:60]
+                        state["logs"].append({"message": f"Chart rejected — x-axis is a list of metrics: {title_preview}", "done": True})
+                        tool_messages.append(ToolMessage(
+                            tool_call_id=call["id"],
+                            content=(
+                                f"REJECTED: chart '{title_preview}' uses metric names as x-axis categories. "
+                                "A chart must show ONE metric: x_axis must be entity names (countries/companies) "
+                                "or time periods (years/months). Pick the single most relevant metric for the "
+                                "user's question (e.g. 'Real GDP growth') and plot it per entity instead."
+                            ),
+                        ))
+                        continue
+
+                    # ── Grounding guard: reject charts whose numbers aren't in any source ──
+                    rejects = state.get("chart_reject_count", 0)
+                    if rejects < _MAX_CHART_REJECTS:
+                        corpus = _corpus_numbers(
+                            resources,
+                            state.get("extracted_numerics", []),
+                            state.get("chart_datasets", []),
+                        )
+                        grounded, checked = _chart_grounding(call["args"].get("series") or [], corpus)
+                        if checked >= 3 and grounded / checked < 0.5:
+                            state["chart_reject_count"] = rejects + 1
+                            title_preview = str(call["args"].get("title", ""))[:60]
+                            state["logs"].append({"message": f"Chart rejected — data not found in sources: {title_preview}", "done": True})
+                            tool_messages.append(ToolMessage(
+                                tool_call_id=call["id"],
+                                content=(
+                                    f"REJECTED: chart '{title_preview}' uses numbers that do not appear in any search result "
+                                    f"(only {grounded}/{checked} values verified against sources). Do NOT invent, round off, or "
+                                    "interpolate values. Use ONLY the exact figures from the CHART-READY DATASETS / NUMERICAL FACTS "
+                                    "in your context, or call Search/DeepScrapeWebsite to find the real figures first. "
+                                    "If the exact data cannot be found, skip this chart entirely."
+                                ),
+                            ))
+                            continue
+
                     result = run_chart_tool(call["args"])
                     if result.startswith("CHART_READY:"):
                         rest = result[len("CHART_READY:"):]
@@ -450,6 +575,31 @@ Every reply, every section of the report, all headings and chart explanations MU
                         chart_id = meta[:colon_idx]
                         chart_title = meta[colon_idx + 1:]
                         option = _json_chart.loads(option_json)
+
+                        # ── Dedupe: same title (ignoring year-range suffixes) → reuse/update ──
+                        def _title_key(t: str) -> str:
+                            return re.sub(r"\s*\([^)]*\)\s*", " ", t or "").strip().lower()
+
+                        norm_title = _title_key(chart_title)
+                        existing = next(
+                            (c for c in state.get("charts", []) if _title_key(c.get("title", "")) == norm_title),
+                            None,
+                        )
+                        if existing is not None:
+                            if existing.get("option", {}).get("series") != option.get("series"):
+                                existing["option"] = option  # refresh data; keep id so report markers stay valid
+                                if call["args"].get("source_attribution"):
+                                    existing["source"] = call["args"]["source_attribution"]
+                            state["logs"].append({"message": f"Chart reused: {chart_title}", "done": True})
+                            tool_messages.append(ToolMessage(
+                                tool_call_id=call["id"],
+                                content=(
+                                    f"Chart '{chart_title}' already exists with ID {existing['id']} (data refreshed). "
+                                    f"Reuse the marker [CHART:{existing['id']}] in your report — do NOT generate this chart again."
+                                ),
+                            ))
+                            continue
+
                         chart_spec: ChartSpec = {"id": chart_id, "title": chart_title, "option": option}
                         if call["args"].get("source_attribution"):
                             chart_spec["source"] = call["args"]["source_attribution"]
@@ -533,16 +683,18 @@ Every reply, every section of the report, all headings and chart explanations MU
                     resources_list = resources  # use content-enriched local var
                     extracted_facts = state.get("extracted_numerics", [])
 
+                    verified: Dict[str, dict] = {}
                     if _MARKER_RE.search(state["report"]):
                         # LLM added its own [N] markers — verify each against source content
-                        state["report"], state["citations"] = _verify_llm_citations(
+                        state["report"], verified = _verify_llm_citations(
                             state["report"], resources_list
                         )
-                    else:
-                        # Auto-inject: match extracted fact values against resource content
-                        state["report"], state["citations"] = _auto_inject_citations(
-                            state["report"], extracted_facts, resources_list
-                        )
+                    # Supplement: inject markers for numbers the LLM left uncited
+                    # (only values verifiably present in a source get a marker)
+                    state["report"], auto_cit = _auto_inject_citations(
+                        state["report"], extracted_facts, resources_list
+                    )
+                    state["citations"] = {**auto_cit, **verified}
 
                     # Charts must survive report rewrites (critic retries tended to
                     # drop the inline markers) — re-append any chart not referenced.
@@ -568,6 +720,7 @@ Every reply, every section of the report, all headings and chart explanations MU
                     "extracted_numerics": state.get("extracted_numerics", []),
                     "chart_datasets": state.get("chart_datasets", []),
                     "citations": state.get("citations", {}),
+                    "chart_reject_count": state.get("chart_reject_count", 0),
                 }
             )
         else:
@@ -583,6 +736,7 @@ Every reply, every section of the report, all headings and chart explanations MU
                     "extracted_numerics": state.get("extracted_numerics", []),
                     "chart_datasets": state.get("chart_datasets", []),
                     "citations": state.get("citations", {}),
+                    "chart_reject_count": state.get("chart_reject_count", 0),
                 }
             )
             
