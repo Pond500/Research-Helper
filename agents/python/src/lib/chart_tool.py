@@ -144,8 +144,11 @@ def _build_option(
     # LINE / AREA
     if chart_type in ("line", "area"):
         has_many_points = len(x_axis or []) > 12
+        # Many-points charts get a bottom zoom slider; park the legend at the
+        # top-right (beside the title) so it doesn't overlap the slider.
+        legend_pos = {"top": 4, "right": 8} if has_many_points else {"bottom": 0}
         opt = {**base,
-            "legend": {"show": True, "bottom": 28 if has_many_points else 0, "type": "scroll",
+            "legend": {"show": True, **legend_pos, "type": "scroll",
                        "textStyle": {"fontSize": 11, "color": "#6B7280"},
                        "inactiveColor": "#D1D5DB"},
             "xAxis": {
@@ -624,6 +627,15 @@ class GeneratePlotlyChartInput(BaseModel):
     y_axis_secondary_name: Optional[str] = Field(default=None,
         description="Right Y-axis label — only for combination charts with two scales.")
     source_attribution: str = Field(description="Data source citation shown on the chart.")
+    data_basis: Literal["reported", "derived"] = Field(
+        default="reported",
+        description=(
+            "'reported' (default) = values copied verbatim from sources (revenue, prices, counts). "
+            "'derived' = values you CALCULATED from source numbers (growth %, YoY change, ratios, shares). "
+            "Use 'derived' ONLY when every value is computed from figures that appear in the sources — "
+            "never to pass off invented numbers. Label derived series clearly (e.g. 'YoY growth %')."
+        ),
+    )
     country_iso: Optional[List[str]] = Field(default=None, description="ISO-3 codes for map charts.")
     parent: Optional[List[str]] = Field(default=None, description="Parent node names for treemap.")
 

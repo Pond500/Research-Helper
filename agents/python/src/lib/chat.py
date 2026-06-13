@@ -80,8 +80,8 @@ def _auto_inject_citations(
                     value_to_n[val] = i + 1
 
     # ── Strategy B: extract numbers FROM each resource, find them IN the report ──
-    if not value_to_n:
-        for i, resource in enumerate(resources[:20]):
+    # Runs in addition to A (skips values A already matched) to raise coverage.
+    for i, resource in enumerate(resources[:20]):
             content_raw = resource.get("content", "") or resource.get("description", "")
             if not content_raw:
                 continue
@@ -400,6 +400,7 @@ TODAY'S DATE: {today.isoformat()} (พ.ศ. {today.year + 543}) — the current 
    • พบ URL ของ Wikipedia, WorldBank, IMF, OECD ที่น่าจะมีตาราง historical
    • ตัวอย่าง URL ที่มีข้อมูลครบ: Wikipedia "GDP by country", WorldBank "data.worldbank.org"
    ❌ ห้าม WriteReport ถ้ายังขาดข้อมูลปีใดปีหนึ่งในช่วงที่ผู้ใช้ถาม
+   ⚠️ ถ้ากราฟ time-series ที่จะสร้างมีจุดข้อมูลน้อยกว่า 5 จุด หรือขาดปีในช่วงที่ผู้ใช้ถาม → ต้อง Search/DeepScrape เพิ่มก่อนเสมอ ห้ามสร้างกราฟที่มีแค่ 2-3 จุดทั้งที่ผู้ใช้ขอข้อมูลหลายปี
 
 4. VISUALIZE DATA — หลังได้ข้อมูลตัวเลขแล้ว ต้องเรียก GeneratePlotlyChart อย่างน้อย 1 ครั้ง (ดูกฎด้านล่าง)
 5. STRUCTURED COMPONENTS — เรียก GenerateA2UIComponent เพื่อแสดงตัวเลขสำคัญและตารางเปรียบเทียบ
@@ -412,6 +413,7 @@ TODAY'S DATE: {today.isoformat()} (พ.ศ. {today.year + 543}) — the current 
 ▸ MANDATORY: ถ้าหัวข้อมีสถิติ, ตัวเลข, การเปรียบเทียบ, หรือแนวโน้ม → ต้องสร้างกราฟเสมอ ห้ามรอให้ผู้ใช้ขอ
 ▸ ถ้ามี CHART-READY DATASETS ใน "📊 ข้อมูลจริง" ด้านล่าง → ต้องใช้ค่าเหล่านั้นโดยตรงใน GeneratePlotlyChart ห้าม hallucinate ตัวเลข
 ▸ ตัวเลขทุกตัวในกราฟต้องมาจาก search results เป๊ะ ๆ — ห้ามปัดเป็นเลขกลม ห้าม interpolate เติมปีที่ไม่มีข้อมูล (ระบบจะตรวจและปฏิเสธกราฟที่ตัวเลขไม่ตรงแหล่ง)
+▸ ถ้ากราฟแสดงค่าที่ "คำนวณเอง" (อัตราการเติบโต %, YoY, สัดส่วน, ratio) ต้องตั้ง data_basis="derived" และคำนวณจากตัวเลขที่อยู่ในแหล่งจริงเท่านั้น พร้อมตั้งชื่อ series ให้ชัดว่าเป็นค่าคำนวณ — ห้ามใช้ "derived" เพื่อเลี่ยงการตรวจแล้วใส่ตัวเลขมั่ว
 ▸ ใส่เฉพาะ entity ที่ผู้ใช้ถามเท่านั้น — ถ้าคำถามระบุกลุ่ม (เช่น ASEAN, G7, EU) ให้กรองข้อมูลเหลือเฉพาะสมาชิกของกลุ่มนั้น ห้ามลอกทั้งตารางจากแหล่งมาทั้งดุ้น
 ▸ แกน x ต้องเป็นชื่อ entity (ประเทศ/บริษัท/แบรนด์) หรือช่วงเวลา (ปี/เดือน) เท่านั้น — หนึ่งกราฟต่อหนึ่ง metric ห้ามเอาชื่อ metric หลายตัว (เช่น "Real GDP growth", "Inflation rate") มาเรียงเป็นแกน x ในกราฟเดียว
 ▸ ค่าของปีอนาคตหรือค่าคาดการณ์ ต้องระบุในชื่อกราฟหรือชื่อ series ว่า "(คาดการณ์)" / "(forecast)" ให้ชัดเจน
@@ -541,8 +543,11 @@ TODAY'S DATE: {today.isoformat()} (พ.ศ. {today.year + 543}) — the current 
                         continue
 
                     # ── Grounding guard: reject charts whose numbers aren't in any source ──
+                    # Skipped for explicitly-derived charts (growth %, ratios) — those
+                    # values are computed, so they won't appear verbatim in sources.
                     rejects = state.get("chart_reject_count", 0)
-                    if rejects < _MAX_CHART_REJECTS:
+                    is_derived = call["args"].get("data_basis") == "derived"
+                    if rejects < _MAX_CHART_REJECTS and not is_derived:
                         corpus = _corpus_numbers(
                             resources,
                             state.get("extracted_numerics", []),
