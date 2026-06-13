@@ -1,0 +1,41 @@
+{
+  "single_turn": [
+    {"name": "th_car_broad",      "lang": "th", "type": "broad",         "topic": "thai_cars",  "pair": "thai_cars", "q": "ส่วนแบ่งตลาดรถยนต์ในไทยเป็นยังไง"},
+    {"name": "th_car_specific",   "lang": "th", "type": "specific",     "topic": "thai_cars",  "pair": "thai_cars", "q": "ส่วนแบ่งตลาดรถยนต์ในไทยปี 2024 แยกตามค่าย ทั้งรถสันดาป (ICE) และรถยนต์ไฟฟ้า (EV) เป็นยังไง"},
+    {"name": "en_cloud_broad",    "lang": "en", "type": "broad",         "topic": "cloud",      "pair": "cloud",     "q": "How is the global cloud computing market doing?"},
+    {"name": "en_cloud_specific", "lang": "en", "type": "specific",     "topic": "cloud",      "pair": "cloud",     "q": "What was the global cloud infrastructure market share by provider (AWS, Microsoft Azure, Google Cloud) in 2024?"},
+    {"name": "th_vn_broad",       "lang": "th", "type": "broad",         "topic": "vietnam",    "pair": "vietnam",   "q": "เศรษฐกิจเวียดนามเป็นยังไงบ้าง"},
+    {"name": "th_vn_specific",    "lang": "th", "type": "specific",     "topic": "vietnam",    "pair": "vietnam",   "q": "อัตราการเติบโตของ GDP และมูลค่า FDI ของเวียดนามรายปีตั้งแต่ 2019 ถึง 2024 เป็นยังไง"},
+    {"name": "en_phone_broad",    "lang": "en", "type": "broad",         "topic": "smartphone", "pair": "smartphone","q": "Tell me about the smartphone market."},
+    {"name": "en_phone_specific", "lang": "en", "type": "specific",     "topic": "smartphone", "pair": "smartphone","q": "Global smartphone shipments by brand in 2024 and each brand's year-over-year change."},
+
+    {"name": "th_oil_timeseries","lang": "th", "type": "time_series",   "topic": "oil",        "q": "ราคาน้ำมันดิบ Brent ย้อนหลัง 10 ปีเป็นยังไง"},
+    {"name": "en_multi_compare", "lang": "en", "type": "multi_entity",  "topic": "tech_fin",   "q": "Compare the annual revenue and net income of Apple, Microsoft, and Alphabet in 2022, 2023, and 2024."},
+    {"name": "en_asean_forecast","lang": "en", "type": "forecast",      "topic": "asean",      "q": "What are the IMF GDP growth forecasts for Thailand, Vietnam, and Indonesia in 2025 and 2026?"},
+    {"name": "th_gold_recency",  "lang": "th", "type": "recency",       "topic": "gold",       "q": "ราคาทองคำตอนนี้เท่าไหร่ และเปลี่ยนแปลงยังไงในปีที่ผ่านมา"},
+    {"name": "th_vague",         "lang": "th", "type": "ambiguous",     "topic": "vague",      "q": "ตลาดช่วงนี้เป็นยังไงบ้าง"},
+    {"name": "en_hard_data",     "lang": "en", "type": "hard_data",     "topic": "salary",     "q": "What is the average monthly salary of software engineers in Chiang Mai, Thailand by experience level in 2024?"},
+    {"name": "th_ranking",       "lang": "th", "type": "ranking",       "topic": "marketcap",  "q": "10 อันดับบริษัทที่มีมูลค่าตลาด (market cap) สูงสุดในโลกปี 2024 มีบริษัทอะไรบ้าง"},
+    {"name": "en_open_trends",   "lang": "en", "type": "open_ended",    "topic": "renewables", "q": "What are the biggest trends in renewable energy right now?"}
+  ],
+  "multi_turn": [
+    {
+      "name": "mt_thai_cars",
+      "lang": "th",
+      "turns": [
+        "ส่วนแบ่งตลาดรถยนต์ในไทยเป็นยังไง",
+        "เจาะเฉพาะตลาด EV รายค่ายในปี 2024 หน่อย",
+        "แล้วเทียบกับปี 2023 ค่ายไหนโตเร็วสุด"
+      ]
+    },
+    {
+      "name": "mt_tesla",
+      "lang": "en",
+      "turns": [
+        "Tell me about Tesla.",
+        "Focus on their annual revenue and vehicle deliveries from 2020 to 2024.",
+        "How does that compare to BYD over the same period?"
+      ]
+    }
+  ]
+}

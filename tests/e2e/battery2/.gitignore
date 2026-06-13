@@ -1,0 +1,6 @@
+out2/
+judge_out.txt
+judge_err.txt
+progress.log
+summary.json
+judge.json
