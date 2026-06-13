@@ -46,9 +46,38 @@ if os.environ.get("LANGGRAPH_FASTAPI", "false").lower() == "false":
     # When running in LangGraph API, don't use a custom checkpointer
     graph = workflow.compile(**compile_kwargs)
 else:
-    # For CopilotKit and other contexts, use MemorySaver
+    # For CopilotKit and other contexts, use an in-memory checkpointer.
+    # The frontend rotates the thread id every turn, so threads would otherwise
+    # accumulate in RAM forever. Cap the number of retained threads (LRU) — a
+    # turn only needs its own thread alive (incl. the delete interrupt/resume).
+    from collections import OrderedDict
+
     from langgraph.checkpoint.memory import MemorySaver
 
-    memory = MemorySaver()
+    MAX_THREADS = int(os.environ.get("CHECKPOINT_MAX_THREADS", "200"))
+
+    class BoundedMemorySaver(MemorySaver):
+        """MemorySaver that evicts least-recently-written threads past a cap."""
+
+        def __init__(self, max_threads: int):
+            super().__init__()
+            self._max_threads = max_threads
+            self._seen: "OrderedDict[str, None]" = OrderedDict()
+
+        def put(self, config, checkpoint, metadata, new_versions):
+            result = super().put(config, checkpoint, metadata, new_versions)
+            thread_id = (config.get("configurable") or {}).get("thread_id")
+            if thread_id is not None:
+                self._seen.pop(thread_id, None)
+                self._seen[thread_id] = None
+                while len(self._seen) > self._max_threads:
+                    old, _ = self._seen.popitem(last=False)
+                    try:
+                        self.delete_thread(old)
+                    except Exception:  # noqa: BLE001 — eviction is best-effort
+                        pass
+            return result
+
+    memory = BoundedMemorySaver(MAX_THREADS)
     compile_kwargs["checkpointer"] = memory
     graph = workflow.compile(**compile_kwargs)

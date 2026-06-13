@@ -66,6 +66,10 @@ async def research_agent_endpoint(input_data: RunAgentInput, request: Request):
         async def pump():
             try:
                 async for event in agent.run(input_data):
+                    # RAW events echo every LangGraph internal step (thousands per
+                    # run) and the frontend ignores them — drop to save bandwidth.
+                    if getattr(event, "type", None) == EventType.RAW:
+                        continue
                     await queue.put(encoder.encode(event))
             except Exception as exc:  # noqa: BLE001 — surface every failure to the client
                 logger.exception("Agent run failed")
