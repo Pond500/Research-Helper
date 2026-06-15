@@ -72,6 +72,7 @@ class AgentState(MessagesState):
     suggested_questions: NotRequired[List[str]]
     delete_confirmation: NotRequired[str]         # "YES"/"NO" answered via the delete interrupt
     chart_reject_count: NotRequired[int]          # ungrounded-chart rejections this thread (capped)
+    report_redirect_count: NotRequired[int]       # times pushed to WriteReport after answering in chat (capped)
     extracted_numerics: NotRequired[List[dict]]   # accumulated NumericFact dicts from all searches
     chart_datasets: NotRequired[List[dict]]       # chart-ready datasets from ExtractNumerics
     citations: NotRequired[Dict[str, dict]]       # "1" → {url, title, snippet}

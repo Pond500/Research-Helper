@@ -37,11 +37,29 @@ app.add_middleware(
 
 logger = logging.getLogger("research_agent")
 
-agent = LangGraphAgent(
-    name="research_agent",
-    description="AI research assistant for gathering and analyzing information.",
-    graph=graph,
-)
+
+class SafeLangGraphAgent(LangGraphAgent):
+    """Works around two ag_ui_langgraph state bugs:
+    - set_message_in_progress crashes when a run emits a second text message:
+      the lib stores None for the run_id after the first message ends, then
+      `{**None}` raises. Coerce None → {}. (hits multi-entity comparisons)
+    """
+
+    def set_message_in_progress(self, run_id, data):
+        current = self.messages_in_process.get(run_id) or {}
+        self.messages_in_process[run_id] = {**current, **data}
+
+
+def make_agent() -> SafeLangGraphAgent:
+    # Fresh instance per request: active_run / messages_in_process are per-run
+    # mutable state on the instance, so a shared agent corrupts under concurrent
+    # requests. The graph (and its checkpointer) is shared and safe.
+    return SafeLangGraphAgent(
+        name="research_agent",
+        description="AI research assistant for gathering and analyzing information.",
+        graph=graph,
+    )
+
 
 HEARTBEAT_SECONDS = 15
 _STREAM_DONE = object()
@@ -59,6 +77,8 @@ async def research_agent_endpoint(input_data: RunAgentInput, request: Request):
     accept_header = request.headers.get("accept")
     encoder = EventEncoder(accept=accept_header)
     is_sse = "text/event-stream" in (accept_header or "text/event-stream")
+
+    agent = make_agent()
 
     async def event_generator():
         queue: asyncio.Queue = asyncio.Queue()

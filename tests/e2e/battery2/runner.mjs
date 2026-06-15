@@ -153,8 +153,9 @@ async function worker(wid) {
 }
 await Promise.all(Array.from({ length: CONCURRENCY }, (_, i) => worker(i + 1)));
 
-if (!filter.length) {
-  for (const flow of cfg.multi_turn) {
+const flowsToRun = cfg.multi_turn.filter((f) => !filter.length || filter.includes(f.name));
+{
+  for (const flow of flowsToRun) {
     process.stderr.write(`[mt] START ${flow.name}\n`);
     const r = await runMultiTurn(flow);
     process.stderr.write(`[mt] DONE ${flow.name} (ok=${r.ok})\n`);

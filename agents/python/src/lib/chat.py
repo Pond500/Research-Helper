@@ -384,9 +384,10 @@ TODAY'S DATE: {today.isoformat()} (พ.ศ. {today.year + 543}) — the current 
    • ห้ามส่งแค่ query ระดับรวม (aggregate) เช่น "EV market share Thailand" โดยไม่มี breakdown query คู่
 
    ⚠️ คำถามอิงเวลาปัจจุบัน ("ตอนนี้", "ช่วงนี้", "ล่าสุด", "current", "now", "today") — กฎบังคับ:
-   • ต้องใส่ปี {today.year} ใน search queries เสมอ (เช่น "gold price {today.year}")
-   • ตรวจวันที่ของข้อมูลที่ได้ — ถ้าข้อมูลล่าสุดที่หาได้เก่ากว่าปัจจุบันมาก ต้องบอกผู้อ่านชัดเจนว่าเป็นข้อมูล ณ วันที่ใด ห้ามนำเสนอข้อมูลเก่าราวกับเป็นข้อมูลปัจจุบัน
-   • ระบุวันที่/ช่วงเวลาของข้อมูลในรายงานและชื่อกราฟเสมอ
+   • ค้นด้วยคำว่า "latest"/"ล่าสุด" + ปี {today.year} (เช่น "gold price latest {today.year}") แต่ให้ "ยอมรับข้อมูลปีล่าสุดที่หาเจอจริง" — ส่วนใหญ่จะเป็นปี {today.year} หรือ {today.year - 1}
+   • ⛔ ห้ามสร้าง/เดาตัวเลขของปี {today.year} (หรือปีที่ยังไม่จบ) เองเด็ดขาด ถ้าแหล่งไม่มี — ให้ใช้ค่าล่าสุดที่หาเจอจริงเท่านั้น
+   • ต้องระบุ "ข้อมูล ณ <วันที่/ปีของแหล่ง>" ในรายงานและชื่อกราฟเสมอ ห้ามเสนอข้อมูลเก่าราวกับเป็นปัจจุบัน
+   • ถ้าหาข้อมูลปัจจุบันไม่ได้จริง → เขียนรายงานบอกตรง ๆ ว่าข้อมูลล่าสุดที่มีคือปีไหน ห้ามจบแค่แชตหรือเดาตัวเลข
 
    ⚠️ ถ้าคำถามระบุช่วงปี (เช่น 2018–2024) — กฎบังคับ:
    • ต้องใส่ปีทุกปีในช่วงนั้นใน query เสมอ เช่น "G7 GDP growth 2018 2019 2020 2021 2022 2023 2024"
@@ -405,7 +406,9 @@ TODAY'S DATE: {today.isoformat()} (พ.ศ. {today.year + 543}) — the current 
 4. VISUALIZE DATA — หลังได้ข้อมูลตัวเลขแล้ว ต้องเรียก GeneratePlotlyChart อย่างน้อย 1 ครั้ง (ดูกฎด้านล่าง)
 5. STRUCTURED COMPONENTS — เรียก GenerateA2UIComponent เพื่อแสดงตัวเลขสำคัญและตารางเปรียบเทียบ
 6. WRITE REPORT — เรียก WriteReport เพื่อเขียนรายงานฉบับสมบูรณ์เป็นภาษาเดียวกับผู้ใช้ ใช้เฉพาะตัวเลขที่ได้จาก search/scrape เท่านั้น ห้าม hallucinate ปีที่ไม่มีข้อมูล
-7. FOLLOW UP — ส่งข้อความสั้น 1-2 ประโยค ถามว่าอยากให้ปรับอะไรเพิ่มเติม
+   ⛔ บังคับ: ทุกคำถามที่ต้องค้นข้อมูล ต้องส่งคำตอบผ่าน WriteReport เสมอ — แม้คำตอบจะสั้นหรือเจาะจง (เช่น "ส่วนแบ่ง AWS 33%") ห้ามตอบแค่ในแชตแล้วจบ เพราะคำตอบในแชตจะไม่ขึ้นแท็บ Report และไม่ผ่านการตรวจคุณภาพ
+   ⛔ คำถามต่อเนื่อง (follow-up) ที่ขอเจาะลึก/เปลี่ยนมุม ก็ต้อง WriteReport ฉบับใหม่ที่อัปเดตตามคำถามล่าสุดเสมอ ห้ามตอบแค่แชตโดยไม่อัปเดตรายงาน
+7. FOLLOW UP — หลัง WriteReport แล้ว ส่งข้อความสั้น 1-2 ประโยค ถามว่าอยากให้ปรับอะไรเพิ่มเติม
 
 ══════════════════════════════════════
 กฎการสร้างกราฟ (CHART RULES — บังคับ)
@@ -754,6 +757,34 @@ TODAY'S DATE: {today.isoformat()} (พ.ศ. {today.year + 543}) — the current 
                     HumanMessage(content="SYSTEM ERROR: You wrote the report as plain text. You MUST use the WriteReport tool to submit the report! Please rewrite it using the WriteReport tool.")
                 ]
             }
+        )
+
+    # Reaching here means the model answered in chat with NO tool call this turn
+    # (a WriteReport would have routed to critic_node, not here). If that chat
+    # answer is a substantive research answer — and the agent has done research —
+    # push it to deliver/refresh the report via WriteReport. This also catches
+    # follow-up turns where a stale report from a prior turn still exists but the
+    # model answered the new question only in chat. Greetings / clarifying
+    # questions (no research, short, no figures) end normally.
+    content = ai_message.content or ""
+    did_research = bool(state.get("resources")) or bool(state.get("research_question"))
+    looks_like_answer = len(content) > 200 or bool(re.search(r"\d", content))
+    redirects = state.get("report_redirect_count", 0)
+    if did_research and looks_like_answer and redirects < 1:
+        logger.info("=== CHAT_NODE: research answered in chat, redirecting to WriteReport ===")
+        return Command(
+            goto="chat_node",
+            update={
+                "messages": [
+                    ai_message,
+                    HumanMessage(content=(
+                        "คุณค้นข้อมูลแล้วแต่ตอบในแชตโดยไม่ได้สร้างรายงาน — ต้องเรียก WriteReport เสมอ "
+                        "เพื่อส่งคำตอบลงแท็บ Report (พร้อม GeneratePlotlyChart ถ้ามีตัวเลข) แม้คำตอบจะสั้นหรือเจาะจง "
+                        "ถ้าข้อมูลไม่ครบ ให้เขียนรายงานเท่าที่มีจริงพร้อมระบุข้อจำกัดและวันที่ของข้อมูล ห้ามจบแค่ในแชต"
+                    )),
+                ],
+                "report_redirect_count": redirects + 1,
+            },
         )
 
     logger.info("=== CHAT_NODE: Routing to __end__ ===")
